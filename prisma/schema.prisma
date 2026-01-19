@@ -1,0 +1,111 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id             String          @id @default(uuid())
+  email          String          @unique
+  name           String?
+  plan           String          @default("free")
+  createdAt      DateTime        @default(now())
+  scheduledPosts ScheduledPost[]
+  socialAccounts SocialAccount[]
+  subscriptions  Subscription[]
+}
+
+model SocialAccount {
+  id             String          @id @default(uuid())
+  userId         String
+  platform       String
+  accountType    String?
+  externalId     String
+  displayName    String?
+  username       String?
+  accessToken    String
+  refreshToken   String?
+  tokenExpiresAt DateTime?
+  scopes         String?
+  isActive       Boolean         @default(true)
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  scheduledPosts ScheduledPost[]
+  user           User            @relation(fields: [userId], references: [id])
+}
+
+model ScheduledPost {
+  id              String        @id @default(uuid())
+  userId          String
+  socialAccountId String
+  platform        String
+  type            String        @default("post")
+  content         String
+  mediaUrl        String?
+  scheduledAt     DateTime
+  timezone        String?
+  status          String        @default("pending")
+  errorMessage    String?
+  externalPostId  String?       // Instagram/Facebook post ID (e.g., "17924266338209280")
+  permalink       String?       // Full URL to the post (e.g., "https://www.instagram.com/reel/DTU2zqgj8BK/")
+  data            Json?         // Additional JSON data (container IDs, processing info, etc.)
+  postedAt        DateTime?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+  socialAccount   SocialAccount @relation(fields: [socialAccountId], references: [id])
+  user            User          @relation(fields: [userId], references: [id])
+}
+
+model Plan {
+  id                        String         @id @default(uuid())
+  name                      String         @unique
+  maxSocialAccounts         Int
+  maxScheduledPostsPerMonth Int
+  priceMonthly              Int
+  createdAt                 DateTime       @default(now())
+  subscriptions             Subscription[]
+}
+
+model Subscription {
+  id                 String   @id @default(uuid())
+  userId             String
+  planId             String
+  status             String   @default("active")
+  currentPeriodStart DateTime
+  currentPeriodEnd   DateTime
+  externalCustomerId String?
+  externalSubId      String?
+  plan               Plan     @relation(fields: [planId], references: [id])
+  user               User     @relation(fields: [userId], references: [id])
+}
+
+model Log {
+  id          String   @id @default(uuid())
+  level       String   // 'info', 'warn', 'error', 'debug'
+  service     String   // 'instagram', 'facebook', 'youtube', etc.
+  message     String
+  method      String?  // HTTP method: GET, POST, PUT, DELETE, etc.
+  path        String?  // Request path/endpoint
+  ipaddress   String?  // Client IP address
+  useragent   String?  @db.Text // User agent/browser info
+  screensize  String?  // Screen size if available (widthxheight)
+  requestdata String?  @db.Text // Request body/data as JSON
+  responsedata String? @db.Text // Response data as JSON
+  statuscode  Int?     // HTTP status code
+  responsetime Int?    // Response time in milliseconds
+  details     String?  @db.Text // Additional details as JSON
+  userid      String?  // Optional user ID if available
+  accountid   String?  // Optional social account ID
+  errorstack  String?  @db.Text // Error stack trace if error
+  createdat   DateTime @default(now())
+
+  @@index([createdat])
+  @@index([level])
+  @@index([service])
+  @@index([userid])
+  @@index([method])
+  @@index([path])
+  @@index([statuscode])
+}

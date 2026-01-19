@@ -1,0 +1,9 @@
+social-accounts/
+ ├─ social-accounts.module.ts
+ ├─ social-accounts.controller.ts   (OAuth connect, list accounts)
+ ├─ social-accounts.service.ts      (DB + token refresh)
+ └─ providers/
+     └─ youtube/
+         ├─ youtube.module.ts
+         ├─ youtube.controller.ts   (test upload, immediate post)
+         └─ youtube.service.ts      (upload, API calls)
