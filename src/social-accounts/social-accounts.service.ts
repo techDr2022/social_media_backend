@@ -1062,9 +1062,27 @@ const res = await axios.post(
     });
 
     if (scheduledPostsCount > 0) {
+      console.log(`⚠️ Cannot delete account ${accountId}: ${scheduledPostsCount} scheduled post(s) found`);
       throw new BadRequestException(
         `Cannot delete account: There are ${scheduledPostsCount} scheduled post(s) associated with this account. Please cancel or complete them first.`
       );
+    }
+
+    // Also check for any posts (success, failed, scheduled) - we'll delete them too
+    const allPostsCount = await this.prisma.scheduledPost.count({
+      where: {
+        socialAccountId: accountId,
+      },
+    });
+
+    if (allPostsCount > 0) {
+      console.log(`🗑️ Deleting ${allPostsCount} associated post(s) for account ${accountId}`);
+      // Delete all posts associated with this account
+      await this.prisma.scheduledPost.deleteMany({
+      where: {
+        socialAccountId: accountId,
+      },
+    });
     }
 
     // Delete the account (hard delete)

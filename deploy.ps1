@@ -88,3 +88,7 @@ Write-Host ""
 Write-Host "📝 View logs:" -ForegroundColor Yellow
 Write-Host "   aws logs tail /ecs/$ECR_REPO --follow --region $AWS_REGION"
 
+
+
+
+

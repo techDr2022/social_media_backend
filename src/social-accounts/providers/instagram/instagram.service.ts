@@ -22,8 +22,23 @@ export class InstagramService {
     scheduledPublishTime?: string;
     locationId?: string;
     userTags?: string;
+    carouselUrls?: string[];
+    carouselItems?: Array<{url: string; type: 'photo' | 'video'}>;
   }) {
-    const { userId, socialAccountId, caption, mediaUrl, mediaType, scheduledPublishTime, locationId, userTags } = params;
+    const { userId, socialAccountId, caption, mediaUrl, mediaType, scheduledPublishTime, locationId, userTags, carouselUrls, carouselItems } = params;
+
+    // Debug logging
+    console.log('🔍 Instagram createPost params:', {
+      mediaType,
+      mediaUrl: mediaUrl ? 'set' : 'undefined',
+      carouselUrls: carouselUrls ? carouselUrls.length : 'undefined',
+      carouselItems: carouselItems ? carouselItems.length : 'undefined',
+    });
+
+    // Validate carousel requirements
+    if (mediaType === 'carousel' && (!carouselItems || carouselItems.length === 0)) {
+      throw new BadRequestException('Carousel posts require at least one media item in carouselItems');
+    }
 
     // Log post creation start (synchronous - no await needed!)
     this.logsService.info(
@@ -102,8 +117,8 @@ export class InstagramService {
         console.log('📅 Scheduled publish time:', scheduledDate.toISOString(), 'Unix:', scheduledTimestamp);
       }
 
-      // Validate media URL if provided
-      if (mediaType && !mediaUrl) {
+      // Validate media URL if provided (but not for carousel posts)
+      if (mediaType && mediaType !== 'carousel' && !mediaUrl) {
         throw new BadRequestException('Media URL is required for photo/video posts');
       }
 
@@ -164,7 +179,7 @@ export class InstagramService {
         try {
           console.log('🔄 Trying /me/media endpoint (Instagram Login format)...');
           containerRes = await axios.post(
-            `https://graph.instagram.com/v24.0/me/media`,
+            `https://graph.instagram.com/v21.0/me/media`,
             containerDataWithoutToken,
             {
               params: {
@@ -181,7 +196,7 @@ export class InstagramService {
           console.log('⚠️ /me/media failed, trying /<IG_ID>/media endpoint...');
           try {
             containerRes = await axios.post(
-              `https://graph.instagram.com/v24.0/${igUserId}/media`,
+              `https://graph.instagram.com/v21.0/${igUserId}/media`,
               containerDataWithoutToken,
               {
                 params: {
@@ -283,7 +298,7 @@ export class InstagramService {
         try {
           console.log('🔄 Trying /me/media endpoint for video (Instagram Login format)...');
           containerRes = await axios.post(
-            `https://graph.instagram.com/v24.0/me/media`,
+            `https://graph.instagram.com/v21.0/me/media`,
             containerDataWithoutToken,
             {
               params: {
@@ -300,7 +315,7 @@ export class InstagramService {
           console.log('⚠️ /me/media failed for video, trying /<IG_ID>/media endpoint...');
           try {
             containerRes = await axios.post(
-              `https://graph.instagram.com/v24.0/${igUserId}/media`,
+              `https://graph.instagram.com/v21.0/${igUserId}/media`,
               containerDataWithoutToken,
               {
                 params: {
@@ -319,8 +334,8 @@ export class InstagramService {
               statusText: igError.response?.statusText,
               error: igError.response?.data,
               message: igError.message,
-              url_me: `https://graph.instagram.com/v24.0/me/media`,
-              url_ig_id: `https://graph.instagram.com/v24.0/${igUserId}/media`,
+              url_me: `https://graph.instagram.com/v21.0/me/media`,
+              url_ig_id: `https://graph.instagram.com/v21.0/${igUserId}/media`,
               token_type: accessToken.startsWith('IGAA') ? 'Instagram Login Token (IGAA)' : 'Unknown',
               token_preview: accessToken.substring(0, 30) + '...',
             });
@@ -351,174 +366,270 @@ export class InstagramService {
         );
 
         // For videos, we need to wait for processing before publishing
-        // Instagram processes videos asynchronously - we need to poll for status
-        // Check status
-        let status = 'IN_PROGRESS';
-        let attempts = 0;
-        videoProcessingAttempts = 0; // Track attempts for database storage
-        const maxAttempts = 30; // 30 attempts × 10 seconds = 5 minutes max wait
-        // Why 30? Instagram videos can take 1-5 minutes to process depending on:
-        // - Video length (longer = more time)
-        // - Video resolution (higher = more time)
-        // - Instagram server load
-        // 5 minutes is a reasonable maximum wait time
+        if (!mediaContainerId) {
+          throw new InternalServerErrorException('Failed to create video container');
+        }
+        await this.waitForVideoProcessing(mediaContainerId, accessToken, userId, socialAccountId);
+      } else if (mediaType === 'carousel' && ((carouselUrls && carouselUrls.length > 0) || (carouselItems && carouselItems.length > 0))) {
+        // Carousel post - create multiple media containers and then a carousel container
+        console.log('🎠 Creating Instagram carousel post...');
+        console.log('🔄 Using Instagram Graph API (graph.instagram.com) for Instagram Login...');
 
-        console.log(`🎬 Starting video processing status check (max ${maxAttempts} attempts, 10 seconds each = ${maxAttempts * 10 / 60} minutes max)`);
-        
-        // Log video processing start
-        this.logsService.info(
-          'instagram',
-          'Starting video processing status check',
-          { containerId: mediaContainerId, maxAttempts, estimatedMaxTime: `${maxAttempts * 10 / 60} minutes` },
-          userId,
-          socialAccountId,
-        );
+        // Support both old carouselUrls and new carouselItems format
+        const items = carouselItems || (carouselUrls ? carouselUrls.map(url => ({ url, type: 'photo' as const })) : []);
 
-        while (status === 'IN_PROGRESS' && attempts < maxAttempts) {
-          // Wait 10 seconds between checks (don't spam Instagram API)
-          await new Promise(resolve => setTimeout(resolve, 10000));
+        console.log('📋 Carousel data:', {
+          itemCount: items.length,
+          caption: caption?.substring(0, 50) || '',
+          has_location: !!locationId,
+          has_user_tags: !!userTags,
+          scheduled: !!scheduledTimestamp,
+          user_id: igUserId,
+          itemTypes: items.map(item => item.type),
+        });
+
+        // Step 1: Create individual media containers for each item
+        const childContainerIds: string[] = [];
+
+        for (let i = 0; i < items.length; i++) {
+          const item = items[i];
+          const mediaUrl = item.url;
+          const mediaType = item.type;
           
-          // Instagram API with Instagram Login uses graph.instagram.com
-          // Access token should be sent as Bearer token in Authorization header
+          // Validate image URL
           try {
-            const statusRes = await axios.get(
-              `https://graph.instagram.com/v24.0/${mediaContainerId}`,
+            console.log(`🔍 Validating carousel ${mediaType} ${i + 1}/${items.length}:`, mediaUrl);
+            const mediaCheck = await axios.head(mediaUrl, { 
+              timeout: 5000,
+              validateStatus: (status) => status < 500
+            });
+            console.log(`✅ Carousel ${mediaType} ${i + 1} is accessible, status:`, mediaCheck.status);
+          } catch (urlError: any) {
+            console.warn(`⚠️ Could not validate carousel ${mediaType} ${i + 1}:`, urlError.message);
+          }
+
+          const containerData: any = {};
+
+          // Set the appropriate URL based on media type
+          if (mediaType === 'video') {
+            containerData.video_url = mediaUrl;
+            containerData.media_type = 'VIDEO';
+            containerData.is_carousel_item = true;
+          } else {
+            containerData.image_url = mediaUrl;
+          }
+
+          // Add location if provided (only to first item for carousel)
+          if (i === 0 && locationId) {
+            containerData.location_id = locationId;
+          }
+
+          // Add user tags if provided (only to first item for carousel)
+          if (i === 0 && userTags) {
+            const tagIds = userTags.split(',').map(id => id.trim()).filter(Boolean);
+            if (tagIds.length > 0) {
+              containerData.user_tags = JSON.stringify(
+                tagIds.map(userId => ({ user_id: userId, x: 0.5, y: 0.5 }))
+              );
+            }
+          }
+
+          console.log(`📤 Creating carousel item container ${i + 1}/${items.length} (${mediaType})...`);
+          
+          const containerDataWithoutToken = { ...containerData };
+          delete containerDataWithoutToken.access_token; // Remove from body
+          
+          let itemContainerRes;
+          try {
+            console.log(`🔄 Trying /me/media endpoint for carousel item ${i + 1}...`);
+            itemContainerRes = await axios.post(
+              `https://graph.instagram.com/v21.0/me/media`,
+              containerDataWithoutToken,
               {
                 params: {
-                  fields: 'status_code',
+                  access_token: accessToken,
                 },
                 headers: {
-                  'Authorization': `Bearer ${accessToken}`, // Send as Bearer token in header
+                  'Content-Type': 'application/json',
                 },
-              }
-            );
-
-            status = statusRes.data.status_code;
-            attempts++;
-            videoProcessingAttempts = attempts; // Update for database storage
-            
-            console.log(`📊 Video processing status: ${status} (attempt ${attempts}/${maxAttempts}, ${attempts * 10} seconds elapsed)`);
-            
-            // Log status check (only every 5 attempts to avoid too many logs)
-            if (attempts % 5 === 0 || status !== 'IN_PROGRESS') {
-              this.logsService.debug(
-                'instagram',
-                'Video processing status check',
-                { status, attempt: attempts, maxAttempts, elapsedSeconds: attempts * 10, containerId: mediaContainerId },
-                userId,
-                socialAccountId,
-              );
-            }
-            
-            // If status is ERROR, fail immediately
-            if (status === 'ERROR') {
-              this.logsService.error(
-                'instagram',
-                'Video processing failed with ERROR status',
-                null,
-                { containerId: mediaContainerId, attempt: attempts },
-                userId,
-                socialAccountId,
-              );
-              throw new InternalServerErrorException(`Video processing failed. Instagram returned ERROR status. Container ID: ${mediaContainerId}`);
-            }
-          } catch (statusError: any) {
-            // If status check fails, log but continue (might be temporary network issue)
-            attempts++;
-            const elapsedSeconds = attempts * 10;
-            console.warn(`⚠️ Status check failed (attempt ${attempts}/${maxAttempts}, ${elapsedSeconds} seconds elapsed):`, {
-              error: statusError.response?.data?.error?.message || statusError.message,
-              status: statusError.response?.status,
-              containerId: mediaContainerId,
-            });
-            
-            // Log status check failure
-            this.logsService.warn(
-              'instagram',
-              'Video processing status check failed',
-              {
-                error: statusError.response?.data?.error?.message || statusError.message,
-                statusCode: statusError.response?.status,
-                attempt: attempts,
-                maxAttempts,
-                elapsedSeconds,
-                containerId: mediaContainerId,
               },
-              userId,
-              socialAccountId,
             );
-            
-            // If we've tried many times and still getting errors, fail
-            if (attempts >= maxAttempts) {
-              this.logsService.error(
-                'instagram',
-                'Video processing status check failed after max attempts',
-                statusError,
+            console.log(`✅ Successfully created carousel item ${i + 1} container`);
+          } catch (meError: any) {
+            console.log(`⚠️ /me/media failed for carousel item ${i + 1}, trying /<IG_ID>/media endpoint...`);
+            try {
+              itemContainerRes = await axios.post(
+                `https://graph.instagram.com/v21.0/${igUserId}/media`,
+                containerDataWithoutToken,
                 {
-                  maxAttempts,
-                  elapsedSeconds: maxAttempts * 10,
-                  containerId: mediaContainerId,
-                  lastError: statusError.response?.data?.error?.message || statusError.message,
+                  params: {
+                    access_token: accessToken,
+                  },
+                  headers: {
+                    'Content-Type': 'application/json',
+                  },
                 },
-                userId,
-                socialAccountId,
               );
-              throw new InternalServerErrorException(
-                `Video processing status check failed after ${maxAttempts} attempts (${maxAttempts * 10} seconds). ` +
-                `Last error: ${statusError.response?.data?.error?.message || statusError.message}. ` +
-                `Container ID: ${mediaContainerId}. ` +
-                `This might be a temporary network issue. Try posting the video again.`
-              );
+              console.log(`✅ Successfully created carousel item ${i + 1} container with /<IG_ID>/media`);
+            } catch (igError: any) {
+              throw meError; // Throw original error
             }
-            
-            // Continue to next attempt (will wait 10 seconds before next check)
-            continue;
+          }
+
+          if (!itemContainerRes || !itemContainerRes.data?.id) {
+            const errorMsg = itemContainerRes?.response?.data?.error?.message || 'Failed to create carousel item container';
+            throw new InternalServerErrorException(
+              `Failed to create carousel item ${i + 1} container: ${errorMsg}`
+            );
+          }
+
+          const itemContainerId = itemContainerRes.data.id;
+          childContainerIds.push(itemContainerId);
+          console.log(`✅ Carousel item ${i + 1} container created: ${itemContainerId}`);
+          
+          // Verify the container exists before proceeding
+          try {
+            console.log(`🔍 Verifying carousel item ${i + 1} container exists...`);
+            const verifyRes = await axios.get(
+              `https://graph.instagram.com/v21.0/${itemContainerId}`,
+              {
+                params: {
+                  fields: 'id,status_code',
+                  access_token: accessToken,
+                },
+              },
+            );
+            console.log(`✅ Container ${itemContainerId} verified:`, {
+              id: verifyRes.data.id,
+              status_code: verifyRes.data.status_code,
+            });
+          } catch (verifyError: any) {
+            console.warn(`⚠️ Could not verify container ${itemContainerId}:`, verifyError.response?.data?.error?.message || verifyError.message);
+            // Continue anyway, but log the issue
+          }
+          
+          // If this is a video, wait for processing to complete
+          if (mediaType === 'video') {
+            console.log(`🎬 Starting video processing for carousel item ${i + 1}...`);
+            await this.waitForVideoProcessing(itemContainerId, accessToken, userId, socialAccountId);
+            console.log(`✅ Video processing completed for carousel item ${i + 1}`);
           }
         }
 
-        // Check final status
-        if (status !== 'FINISHED') {
-          if (status === 'IN_PROGRESS') {
-            this.logsService.error(
-              'instagram',
-              'Video processing timed out',
-              null,
-              { containerId: mediaContainerId, attempts, elapsedSeconds: attempts * 10, finalStatus: status },
-              userId,
-              socialAccountId,
+        // Add a delay to ensure all containers are ready
+        console.log('⏳ Waiting for carousel item containers to be ready...');
+        await new Promise(resolve => setTimeout(resolve, 2000));
+
+        // Validate all child containers exist
+        console.log('🔍 Validating all carousel child containers...');
+        for (let i = 0; i < childContainerIds.length; i++) {
+          const containerId = childContainerIds[i];
+          try {
+            const checkRes = await axios.get(
+              `https://graph.instagram.com/v21.0/${containerId}`,
+              {
+                params: {
+                  fields: 'id,status_code',
+                  access_token: accessToken,
+                },
+              },
             );
+            if (checkRes.data.status_code !== 'FINISHED') {
+              console.warn(`⚠️ Container ${containerId} status: ${checkRes.data.status_code}`);
+            }
+          } catch (checkError: any) {
+            console.error(`❌ Child container ${containerId} validation failed:`, checkError.response?.data?.error?.message || checkError.message);
             throw new InternalServerErrorException(
-              `Video processing timed out after ${maxAttempts} attempts (${maxAttempts * 10} seconds). ` +
-              `The video is still processing. Status: ${status}. ` +
-              `You may need to check Instagram manually or try again later.`
-            );
-          } else {
-            this.logsService.error(
-              'instagram',
-              'Video processing failed with non-FINISHED status',
-              null,
-              { containerId: mediaContainerId, finalStatus: status },
-              userId,
-              socialAccountId,
-            );
-            throw new InternalServerErrorException(
-              `Video processing failed. Final status: ${status}. ` +
-              `Container ID: ${mediaContainerId}`
+              `Child container ${containerId} is not accessible: ${checkError.response?.data?.error?.message || checkError.message}`
             );
           }
         }
+        console.log('✅ All child containers validated');
+
+        // Step 2: Create the carousel container
+        const carouselContainerData: any = {
+          media_type: 'CAROUSEL',
+          children: childContainerIds, // Array of container IDs
+          caption: caption || '',
+        };
+
+        // Schedule if provided
+        if (scheduledTimestamp) {
+          carouselContainerData.scheduled_publish_time = scheduledTimestamp.toString();
+        }
+
+        console.log('📤 Creating carousel container...');
         
-        console.log(`✅ Video processing completed successfully after ${attempts} attempts (${attempts * 10} seconds)`);
+        const carouselDataWithoutToken = { ...carouselContainerData };
+        delete carouselDataWithoutToken.access_token; // Remove from body
         
-        // Log successful video processing
+        let carouselContainerRes;
+        try {
+          console.log('🔄 Trying /me/media endpoint for carousel container...');
+          carouselContainerRes = await axios.post(
+            `https://graph.instagram.com/v21.0/me/media`,
+            carouselDataWithoutToken,
+            {
+              params: {
+                access_token: accessToken,
+              },
+              headers: {
+                'Content-Type': 'application/json',
+              },
+            },
+          );
+          console.log('✅ Successfully created carousel container with /me/media');
+        } catch (meError: any) {
+          console.log('⚠️ /me/media failed for carousel container, trying /<IG_ID>/media endpoint...');
+          try {
+            carouselContainerRes = await axios.post(
+              `https://graph.instagram.com/v21.0/${igUserId}/media`,
+              carouselDataWithoutToken,
+              {
+                params: {
+                  access_token: accessToken,
+                },
+                headers: {
+                  'Content-Type': 'application/json',
+                },
+              },
+            );
+            console.log('✅ Successfully created carousel container with /<IG_ID>/media');
+          } catch (igError: any) {
+            // If both fail
+            const errorMsg = igError.response?.data?.error?.message || igError.message;
+            const errorCode = igError.response?.data?.error?.code;
+            
+            throw new InternalServerErrorException(
+              `Failed to create Instagram carousel container: ${errorMsg}. Error Code: ${errorCode || 'N/A'}.`
+            );
+          }
+        }
+
+        if (!carouselContainerRes || !carouselContainerRes.data?.id) {
+          const errorMsg = carouselContainerRes?.response?.data?.error?.message || 'Failed to create carousel container';
+          throw new InternalServerErrorException(`Failed to create Instagram carousel container: ${errorMsg}`);
+        }
+
+        mediaContainerId = carouselContainerRes.data.id;
+        console.log(`✅ Carousel container created: ${mediaContainerId}`);
+        
+        // Log carousel container creation
         this.logsService.info(
           'instagram',
-          'Video processing completed successfully',
-          { containerId: mediaContainerId, attempts, elapsedSeconds: attempts * 10 },
+          'Carousel container created successfully',
+          { containerId: mediaContainerId, childContainerIds, itemCount: items.length },
           userId,
           socialAccountId,
         );
-      } else if (!mediaType || !mediaUrl) {
+
+        // Wait for carousel container to be ready (similar to video processing)
+        console.log('⏳ Waiting for carousel container to be ready...');
+        if (!mediaContainerId) {
+          throw new InternalServerErrorException('Carousel container ID is missing');
+        }
+        await this.waitForCarouselProcessing(mediaContainerId, accessToken, userId, socialAccountId);
+      } else if (!mediaType || (!mediaUrl && !(mediaType === 'carousel' && ((carouselUrls && carouselUrls.length > 0) || (carouselItems && carouselItems.length > 0))))) {
         // Text-only post (not supported by Instagram, but we'll handle gracefully)
         throw new BadRequestException('Instagram requires media (photo or video). Text-only posts are not supported.');
       }
@@ -543,7 +654,7 @@ export class InstagramService {
         try {
           console.log('🔍 Verifying container exists before publishing...');
           const containerCheck = await axios.get(
-            `https://graph.instagram.com/v24.0/${mediaContainerId}`,
+            `https://graph.instagram.com/v21.0/${mediaContainerId}`,
             {
               params: {
                 fields: 'id,status_code',
@@ -571,7 +682,7 @@ export class InstagramService {
           });
           
           publishRes = await axios.post(
-            `https://graph.instagram.com/v24.0/me/media_publish`,
+            `https://graph.instagram.com/v21.0/me/media_publish`,
             {
               creation_id: mediaContainerId,
             },
@@ -609,7 +720,7 @@ export class InstagramService {
           console.log('⚠️ /me/media_publish failed, trying /<IG_ID>/media_publish endpoint as fallback...');
           try {
             publishRes = await axios.post(
-              `https://graph.instagram.com/v24.0/${igUserId}/media_publish`,
+              `https://graph.instagram.com/v21.0/${igUserId}/media_publish`,
               {
                 creation_id: mediaContainerId,
               },
@@ -708,7 +819,7 @@ export class InstagramService {
           
           console.log('🔗 Fetching post permalink...');
           const permalinkRes = await axios.get(
-            `https://graph.instagram.com/v24.0/${postId}`,
+            `https://graph.instagram.com/v21.0/${postId}`,
             {
               params: {
                 fields: 'permalink',
@@ -744,6 +855,12 @@ export class InstagramService {
             status: 'FINISHED',
           },
         }),
+        ...(mediaType === 'carousel' && carouselUrls && {
+          carousel: {
+            imageCount: carouselUrls.length,
+            imageUrls: carouselUrls,
+          },
+        }),
         publishedAt: new Date().toISOString(),
       };
       
@@ -757,7 +874,7 @@ export class InstagramService {
               platform: 'instagram',
               type: mediaType || 'photo',
               content: caption || '',
-              mediaUrl: mediaUrl || null,
+              mediaUrl: mediaType === 'carousel' ? (carouselUrls && carouselUrls.length > 0 ? carouselUrls[0] : null) : mediaUrl || null,
               scheduledAt,
               status: scheduledPublishTime ? 'scheduled' : 'success',
               postedAt: scheduledPublishTime ? null : new Date(),
@@ -889,6 +1006,12 @@ export class InstagramService {
                 status: 'FAILED',
               },
             }),
+            ...(mediaType === 'carousel' && carouselUrls && {
+              carousel: {
+                imageCount: carouselUrls.length,
+                imageUrls: carouselUrls,
+              },
+            }),
           };
           
           await this.prisma.scheduledPost.create({
@@ -898,7 +1021,7 @@ export class InstagramService {
               platform: 'instagram',
               type: mediaType || 'photo',
               content: caption || '',
-              mediaUrl: mediaUrl || null,
+              mediaUrl: mediaType === 'carousel' ? (carouselUrls && carouselUrls.length > 0 ? carouselUrls[0] : null) : mediaUrl || null,
               scheduledAt: scheduledPublishTime ? new Date(scheduledPublishTime) : new Date(),
               status: 'failed',
               externalPostId: postId ? String(postId) : null, // Save postId if available (partial success)
@@ -939,6 +1062,502 @@ export class InstagramService {
 
       throw new InternalServerErrorException(userMessage);
     }
+  }
+
+  /**
+   * List all Instagram posts/uploads for a given account (for the current user)
+   * This returns rows from ScheduledPost table for platform = 'instagram'
+   */
+  async listPostsForAccount(params: {
+    userId: string;
+    socialAccountId: string;
+  }) {
+    const { userId, socialAccountId } = params;
+
+    // Validate account ownership
+    const account = await this.prisma.socialAccount.findUnique({
+      where: { id: socialAccountId },
+    });
+
+    if (!account || account.platform !== 'instagram') {
+      throw new BadRequestException('Invalid Instagram account');
+    }
+
+    if (account.userId !== userId) {
+      throw new BadRequestException('Account does not belong to user');
+    }
+
+    // Return all scheduledPost rows for this user + account + platform
+    const posts = await this.prisma.scheduledPost.findMany({
+      where: {
+        userId,
+        socialAccountId,
+        platform: 'instagram',
+      },
+      orderBy: [
+        // Show most recently created / scheduled first
+        { createdAt: 'desc' },
+      ],
+    });
+
+    return posts;
+  }
+
+  /**
+   * Delete an Instagram post/upload:
+   * - Attempts to delete from Instagram Graph API (will fail as API doesn't support it)
+   * - Deletes from ScheduledPost table
+   * Note: Instagram Graph API does NOT support deleting published posts, but we attempt it anyway
+   * and handle the error gracefully, then still remove from our database.
+   */
+  async deletePostForAccount(params: {
+    userId: string;
+    socialAccountId: string;
+    scheduledPostId: string;
+  }) {
+    const { userId, socialAccountId, scheduledPostId } = params;
+
+    // Validate account ownership
+    const account = await this.prisma.socialAccount.findUnique({
+      where: { id: socialAccountId },
+    });
+
+    if (!account || account.platform !== 'instagram') {
+      throw new BadRequestException('Invalid Instagram account');
+    }
+
+    if (account.userId !== userId) {
+      throw new BadRequestException('Account does not belong to user');
+    }
+
+    // Find the post
+    const post = await this.prisma.scheduledPost.findFirst({
+      where: {
+        id: scheduledPostId,
+        userId,
+        socialAccountId,
+        platform: 'instagram',
+      },
+    });
+
+    if (!post) {
+      throw new BadRequestException('Post not found or does not belong to user');
+    }
+
+    let igDeleted = false;
+    let igErrorMessage: string | null = null;
+
+    // Attempt to delete from Instagram Graph API if we have an externalPostId
+    // Note: Instagram API doesn't support deleting posts, but we try anyway for completeness
+    if (post.externalPostId) {
+      try {
+        const accessToken = await this.socialAccountsService.getValidInstagramAccessToken(account.id);
+        const igPostId = post.externalPostId;
+
+        console.log(`🗑️ Attempting to delete Instagram post ${igPostId} from Instagram Graph API...`);
+        console.log(`⚠️ Note: Instagram Graph API does NOT support deleting posts, but we'll attempt it anyway.`);
+
+        // Try DELETE request to Instagram Graph API
+        // This will likely fail with "Unsupported delete request" or similar
+        try {
+          const igRes = await axios.delete(
+            `https://graph.instagram.com/v21.0/${igPostId}`,
+            {
+              params: {
+                access_token: accessToken,
+              },
+            },
+          );
+
+          // If somehow it succeeds (unlikely), mark as deleted
+          igDeleted = Boolean(igRes.data?.success || igRes.data === true);
+          console.log(`✅ Instagram Graph API delete result for ${igPostId}:`, igRes.data);
+        } catch (deleteError: any) {
+          // Expected: Instagram API doesn't support DELETE
+          const igError = deleteError.response?.data?.error;
+          const fullErrorResponse = deleteError.response?.data;
+          const statusCode = deleteError.response?.status;
+          
+          // Log the FULL error response so we can see exactly what Instagram says
+          console.error(`❌ Instagram Graph API DELETE request failed:`);
+          console.error(`   Status Code: ${statusCode}`);
+          console.error(`   Error Object:`, JSON.stringify(igError, null, 2));
+          console.error(`   Full Response:`, JSON.stringify(fullErrorResponse, null, 2));
+          console.error(`   Error Message:`, deleteError.message);
+          
+          igErrorMessage =
+            igError?.message ||
+            fullErrorResponse?.error?.message ||
+            deleteError.message ||
+            'Instagram API does not support deleting posts';
+
+          // Check if it's the specific "unsupported" error
+          if (igError?.message?.toLowerCase().includes('unsupported') || 
+              igError?.message?.toLowerCase().includes('does not support') ||
+              igError?.type === 'OAuthException' ||
+              statusCode === 400 || statusCode === 403) {
+            console.log(`✅ Confirmed: Instagram Graph API does NOT support DELETE operation for media posts.`);
+            console.log(`   This is a platform limitation, not a bug.`);
+          } else {
+            console.warn(`⚠️ Unexpected error - might be a different issue (not just unsupported operation)`);
+          }
+          
+          console.log(`ℹ️ Post will be removed from our database only.`);
+        }
+      } catch (tokenError: any) {
+        console.warn(`⚠️ Failed to get access token for Instagram delete:`, tokenError.message);
+        igErrorMessage = `Failed to get access token: ${tokenError.message}`;
+      }
+    } else {
+      console.log(`ℹ️ Post ${post.id} has no externalPostId; cannot attempt Instagram deletion.`);
+    }
+
+    // Always remove from our database, regardless of Instagram API result
+    await this.prisma.scheduledPost.delete({
+      where: { id: post.id },
+    });
+
+    console.log(`✅ Post record deleted from database: ${post.id}`);
+
+    // Build response message
+    let message = 'Post removed from your history.';
+    if (igDeleted) {
+      message = 'Post deleted from Instagram and removed from your history.';
+    } else if (post.externalPostId) {
+      message = 'Post removed from your history. Note: Instagram does not allow deleting published posts via API. You can delete it manually from the Instagram app.';
+    }
+
+    return {
+      success: true,
+      igDeleted,
+      message,
+      igErrorMessage: igErrorMessage || undefined,
+    };
+  }
+
+  /**
+   * Wait for video processing to complete
+   */
+  private async waitForVideoProcessing(
+    mediaContainerId: string,
+    accessToken: string,
+    userId: string,
+    socialAccountId: string
+  ): Promise<void> {
+    // For videos, we need to wait for processing before publishing
+    // Instagram processes videos asynchronously - we need to poll for status
+    let status = 'IN_PROGRESS';
+    let attempts = 0;
+    const maxAttempts = 30; // 30 attempts × 10 seconds = 5 minutes max wait
+
+    console.log(`🎬 Starting video processing status check (max ${maxAttempts} attempts, 10 seconds each = ${maxAttempts * 10 / 60} minutes max)`);
+
+    // Log video processing start
+    this.logsService.info(
+      'instagram',
+      'Starting video processing status check',
+      { containerId: mediaContainerId, maxAttempts, estimatedMaxTime: `${maxAttempts * 10 / 60} minutes` },
+      userId,
+      socialAccountId,
+    );
+
+    while (status === 'IN_PROGRESS' && attempts < maxAttempts) {
+      // Wait 10 seconds between checks (don't spam Instagram API)
+      await new Promise(resolve => setTimeout(resolve, 10000));
+
+      try {
+        const statusRes = await axios.get(
+          `https://graph.instagram.com/v21.0/${mediaContainerId}`,
+          {
+            params: {
+              fields: 'status_code',
+            },
+            headers: {
+              'Authorization': `Bearer ${accessToken}`,
+            },
+          }
+        );
+
+        status = statusRes.data.status_code;
+        attempts++;
+
+        console.log(`📊 Video processing status: ${status} (attempt ${attempts}/${maxAttempts}, ${attempts * 10} seconds elapsed)`);
+
+        // Log status check (only every 5 attempts to avoid too many logs)
+        if (attempts % 5 === 0 || status !== 'IN_PROGRESS') {
+          this.logsService.debug(
+            'instagram',
+            'Video processing status check',
+            { status, attempt: attempts, maxAttempts, elapsedSeconds: attempts * 10, containerId: mediaContainerId },
+            userId,
+            socialAccountId,
+          );
+        }
+
+        // If status is ERROR, fail immediately
+        if (status === 'ERROR') {
+          this.logsService.error(
+            'instagram',
+            'Video processing failed with ERROR status',
+            null,
+            { containerId: mediaContainerId, attempt: attempts },
+            userId,
+            socialAccountId,
+          );
+          throw new InternalServerErrorException(`Video processing failed. Instagram returned ERROR status. Container ID: ${mediaContainerId}`);
+        }
+      } catch (statusError: any) {
+        attempts++;
+        const elapsedSeconds = attempts * 10;
+        console.warn(`⚠️ Status check failed (attempt ${attempts}/${maxAttempts}, ${elapsedSeconds} seconds elapsed):`, {
+          error: statusError.response?.data?.error?.message || statusError.message,
+          status: statusError.response?.status,
+          containerId: mediaContainerId,
+        });
+
+        // Log status check failure
+        this.logsService.warn(
+          'instagram',
+          'Video processing status check failed',
+          {
+            error: statusError.response?.data?.error?.message || statusError.message,
+            statusCode: statusError.response?.status,
+            attempt: attempts,
+            maxAttempts,
+            elapsedSeconds,
+            containerId: mediaContainerId,
+          },
+          userId,
+          socialAccountId,
+        );
+
+        // If we've tried many times and still getting errors, fail
+        if (attempts >= maxAttempts) {
+          this.logsService.error(
+            'instagram',
+            'Video processing status check failed after max attempts',
+            statusError,
+            {
+              maxAttempts,
+              elapsedSeconds: maxAttempts * 10,
+              containerId: mediaContainerId,
+              lastError: statusError.response?.data?.error?.message || statusError.message,
+            },
+            userId,
+            socialAccountId,
+          );
+          throw new InternalServerErrorException(
+            `Video processing status check failed after ${maxAttempts} attempts (${maxAttempts * 10} seconds). ` +
+            `Last error: ${statusError.response?.data?.error?.message || statusError.message}. ` +
+            `Container ID: ${mediaContainerId}.`
+          );
+        }
+        continue;
+      }
+    }
+
+    // Check final status
+    if (status !== 'FINISHED') {
+      if (status === 'IN_PROGRESS') {
+        this.logsService.error(
+          'instagram',
+          'Video processing timed out',
+          null,
+          { containerId: mediaContainerId, attempts, elapsedSeconds: attempts * 10, finalStatus: status },
+          userId,
+          socialAccountId,
+        );
+        throw new InternalServerErrorException(
+          `Video processing timed out after ${maxAttempts} attempts (${maxAttempts * 10} seconds). ` +
+          `The video is still processing. Status: ${status}.`
+        );
+      } else {
+        this.logsService.error(
+          'instagram',
+          'Video processing failed with non-FINISHED status',
+          null,
+          { containerId: mediaContainerId, finalStatus: status },
+          userId,
+          socialAccountId,
+        );
+        throw new InternalServerErrorException(
+          `Video processing failed. Final status: ${status}. ` +
+          `Container ID: ${mediaContainerId}`
+        );
+      }
+    }
+
+    console.log(`✅ Video processing completed successfully after ${attempts} attempts (${attempts * 10} seconds)`);
+
+    // Log successful video processing
+    this.logsService.info(
+      'instagram',
+      'Video processing completed successfully',
+      { containerId: mediaContainerId, attempts, elapsedSeconds: attempts * 10 },
+      userId,
+      socialAccountId,
+    );
+  }
+
+  private async waitForCarouselProcessing(
+    mediaContainerId: string,
+    accessToken: string,
+    userId: string,
+    socialAccountId: string
+  ): Promise<void> {
+    // For carousel containers, we need to wait for processing before publishing
+    // Similar to video processing but carousels might process faster
+    let status = 'IN_PROGRESS';
+    let attempts = 0;
+    const maxAttempts = 12; // 12 attempts × 5 seconds = 1 minute max wait
+
+    console.log(`🎠 Starting carousel processing status check (max ${maxAttempts} attempts, 5 seconds each = ${maxAttempts * 5 / 60} minutes max)`);
+
+    // Log carousel processing start
+    this.logsService.info(
+      'instagram',
+      'Starting carousel processing status check',
+      { containerId: mediaContainerId, maxAttempts, estimatedMaxTime: `${maxAttempts * 5 / 60} minutes` },
+      userId,
+      socialAccountId,
+    );
+
+    while (status === 'IN_PROGRESS' && attempts < maxAttempts) {
+      // Wait 5 seconds between checks (carousel should process faster than video)
+      await new Promise(resolve => setTimeout(resolve, 5000));
+
+      try {
+        const statusRes = await axios.get(
+          `https://graph.instagram.com/v21.0/${mediaContainerId}`,
+          {
+            params: {
+              fields: 'status_code',
+            },
+            headers: {
+              'Authorization': `Bearer ${accessToken}`,
+            },
+          }
+        );
+
+        status = statusRes.data.status_code;
+        attempts++;
+
+        console.log(`📊 Carousel processing status: ${status} (attempt ${attempts}/${maxAttempts}, ${attempts * 5} seconds elapsed)`);
+
+        // Log status check (only every 3 attempts to avoid too many logs)
+        if (attempts % 3 === 0 || status !== 'IN_PROGRESS') {
+          this.logsService.debug(
+            'instagram',
+            'Carousel processing status check',
+            { status, attempt: attempts, maxAttempts, elapsedSeconds: attempts * 5, containerId: mediaContainerId },
+            userId,
+            socialAccountId,
+          );
+        }
+
+        // If status is ERROR, fail immediately
+        if (status === 'ERROR') {
+          this.logsService.error(
+            'instagram',
+            'Carousel processing failed with ERROR status',
+            null,
+            { containerId: mediaContainerId, attempt: attempts },
+            userId,
+            socialAccountId,
+          );
+          throw new InternalServerErrorException(`Carousel processing failed. Instagram returned ERROR status. Container ID: ${mediaContainerId}`);
+        }
+      } catch (statusError: any) {
+        attempts++;
+        const elapsedSeconds = attempts * 5;
+        console.warn(`⚠️ Carousel status check failed (attempt ${attempts}/${maxAttempts}, ${elapsedSeconds} seconds elapsed):`, {
+          error: statusError.response?.data?.error?.message || statusError.message,
+          status: statusError.response?.status,
+          containerId: mediaContainerId,
+        });
+
+        // Log status check failure
+        this.logsService.warn(
+          'instagram',
+          'Carousel processing status check failed',
+          {
+            error: statusError.response?.data?.error?.message || statusError.message,
+            statusCode: statusError.response?.status,
+            attempt: attempts,
+            maxAttempts,
+            elapsedSeconds,
+            containerId: mediaContainerId,
+          },
+          userId,
+          socialAccountId,
+        );
+
+        // If we've tried many times and still getting errors, fail
+        if (attempts >= maxAttempts) {
+          this.logsService.error(
+            'instagram',
+            'Carousel processing status check failed after max attempts',
+            statusError,
+            {
+              maxAttempts,
+              elapsedSeconds: maxAttempts * 5,
+              containerId: mediaContainerId,
+              lastError: statusError.response?.data?.error?.message || statusError.message,
+            },
+            userId,
+            socialAccountId,
+          );
+          throw new InternalServerErrorException(
+            `Carousel processing status check failed after ${maxAttempts} attempts (${maxAttempts * 5} seconds). ` +
+            `Last error: ${statusError.response?.data?.error?.message || statusError.message}. ` +
+            `Container ID: ${mediaContainerId}.`
+          );
+        }
+        continue;
+      }
+    }
+
+    // Check final status
+    if (status !== 'FINISHED') {
+      if (status === 'IN_PROGRESS') {
+        this.logsService.error(
+          'instagram',
+          'Carousel processing timed out',
+          null,
+          { containerId: mediaContainerId, attempts, elapsedSeconds: attempts * 5, finalStatus: status },
+          userId,
+          socialAccountId,
+        );
+        throw new InternalServerErrorException(
+          `Carousel processing timed out after ${maxAttempts} attempts (${maxAttempts * 5} seconds). ` +
+          `The carousel is still processing. Status: ${status}.`
+        );
+      } else {
+        this.logsService.error(
+          'instagram',
+          'Carousel processing failed with non-FINISHED status',
+          null,
+          { containerId: mediaContainerId, finalStatus: status },
+          userId,
+          socialAccountId,
+        );
+        throw new InternalServerErrorException(
+          `Carousel processing failed. Final status: ${status}. ` +
+          `Container ID: ${mediaContainerId}`
+        );
+      }
+    }
+
+    console.log(`✅ Carousel processing completed successfully after ${attempts} attempts (${attempts * 5} seconds)`);
+
+    // Log successful carousel processing
+    this.logsService.info(
+      'instagram',
+      'Carousel processing completed successfully',
+      { containerId: mediaContainerId, attempts, elapsedSeconds: attempts * 5 },
+      userId,
+      socialAccountId,
+    );
   }
 }
 

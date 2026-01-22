@@ -383,4 +383,211 @@ export class YoutubeService {
       }
     }
   }
+
+  async getYoutubeStatistics(params: {
+    userId: string;
+    socialAccountId: string;
+  }) {
+    const { userId, socialAccountId } = params;
+
+    // 🔐 OWNERSHIP CHECK
+    const account = await this.prisma.socialAccount.findFirst({
+      where: {
+        id: socialAccountId,
+        userId,
+        platform: 'youtube',
+        isActive: true,
+      },
+    });
+
+    if (!account) {
+      throw new BadRequestException('YouTube account not found or access denied');
+    }
+
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+
+    // Count videos published (status = 'success')
+    const videosPublished = await this.prisma.scheduledPost.count({
+      where: {
+        userId,
+        socialAccountId,
+        platform: 'youtube',
+        type: 'video',
+        status: 'success',
+      },
+    });
+
+    // Count scheduled videos (status = 'success' and scheduledAt > now)
+    const scheduled = await this.prisma.scheduledPost.count({
+      where: {
+        userId,
+        socialAccountId,
+        platform: 'youtube',
+        type: 'video',
+        status: 'success',
+        scheduledAt: {
+          gt: now,
+        },
+      },
+    });
+
+    // Count videos published this month
+    const thisMonth = await this.prisma.scheduledPost.count({
+      where: {
+        userId,
+        socialAccountId,
+        platform: 'youtube',
+        type: 'video',
+        status: 'success',
+        postedAt: {
+          gte: startOfMonth,
+        },
+      },
+    });
+
+    return {
+      videosPublished,
+      scheduled,
+      thisMonth,
+    };
+  }
+
+  async getRecentYoutubeVideos(params: {
+    userId: string;
+    socialAccountId: string;
+    page?: number;
+    limit?: number;
+  }) {
+    const { userId, socialAccountId, page = 1, limit = 10 } = params;
+
+    // 🔐 OWNERSHIP CHECK
+    const account = await this.prisma.socialAccount.findFirst({
+      where: {
+        id: socialAccountId,
+        userId,
+        platform: 'youtube',
+        isActive: true,
+      },
+    });
+
+    if (!account) {
+      throw new BadRequestException('YouTube account not found or access denied');
+    }
+
+    // Get access token for YouTube API calls
+    const accessToken =
+      await this.socialAccountsService.getValidYoutubeAccessToken(account.id);
+
+    // Fetch recent successful uploads from database
+    const skip = (page - 1) * limit;
+    const posts = await this.prisma.scheduledPost.findMany({
+      where: {
+        userId,
+        socialAccountId,
+        platform: 'youtube',
+        type: 'video',
+        status: 'success',
+      },
+      orderBy: {
+        postedAt: 'desc',
+      },
+      skip,
+      take: limit,
+    });
+
+    // Enrich with YouTube API data
+    const enrichedVideos = await Promise.all(
+      posts.map(async (post) => {
+        try {
+          // Parse content to extract video details
+          const contentData = JSON.parse(post.content || '{}');
+          const videoId = contentData.videoId || post.errorMessage; // errorMessage stores videoId on success
+
+          if (!videoId) {
+            return {
+              id: post.id,
+              title: contentData.title || 'Untitled',
+              description: contentData.description || '',
+              privacy: contentData.privacyStatus || 'private',
+              restrictions: contentData.ageRestricted ? 'Age Restricted' : 'None',
+              date: post.postedAt || post.scheduledAt,
+              views: 0,
+              comments: 0,
+              likes: 0,
+              thumbnail: null,
+              videoUrl: post.mediaUrl,
+              studioUrl: `https://studio.youtube.com/video/${videoId}/edit`,
+            };
+          }
+
+          // Fetch video statistics and thumbnail from YouTube API
+          try {
+            const videoRes = await axios.get(
+              `https://www.googleapis.com/youtube/v3/videos?part=statistics,snippet&id=${videoId}`,
+              {
+                headers: {
+                  Authorization: `Bearer ${accessToken}`,
+                },
+              },
+            );
+
+            const video = videoRes.data.items?.[0];
+            if (video) {
+              return {
+                id: post.id,
+                title: video.snippet?.title || contentData.title || 'Untitled',
+                description: video.snippet?.description || contentData.description || '',
+                privacy: contentData.privacyStatus || video.status?.privacyStatus || 'private',
+                restrictions: contentData.ageRestricted ? 'Age Restricted' : 'None',
+                date: post.postedAt || post.scheduledAt,
+                views: parseInt(video.statistics?.viewCount || '0', 10),
+                comments: parseInt(video.statistics?.commentCount || '0', 10),
+                likes: parseInt(video.statistics?.likeCount || '0', 10),
+                thumbnail: video.snippet?.thumbnails?.medium?.url || video.snippet?.thumbnails?.default?.url || null,
+                videoUrl: `https://www.youtube.com/watch?v=${videoId}`,
+                studioUrl: `https://studio.youtube.com/video/${videoId}/edit`,
+              };
+            }
+          } catch (apiErr: any) {
+            console.error(`Failed to fetch YouTube API data for video ${videoId}:`, apiErr.message);
+          }
+
+          // Fallback if API call fails
+          return {
+            id: post.id,
+            title: contentData.title || 'Untitled',
+            description: contentData.description || '',
+            privacy: contentData.privacyStatus || 'private',
+            restrictions: contentData.ageRestricted ? 'Age Restricted' : 'None',
+            date: post.postedAt || post.scheduledAt,
+            views: 0,
+            comments: 0,
+            likes: 0,
+            thumbnail: null,
+            videoUrl: post.mediaUrl,
+            studioUrl: `https://studio.youtube.com/video/${videoId}/edit`,
+          };
+        } catch (parseErr: any) {
+          console.error(`Failed to parse content for post ${post.id}:`, parseErr.message);
+          return {
+            id: post.id,
+            title: 'Untitled',
+            description: '',
+            privacy: 'private',
+            restrictions: 'None',
+            date: post.postedAt || post.scheduledAt,
+            views: 0,
+            comments: 0,
+            likes: 0,
+            thumbnail: null,
+            videoUrl: post.mediaUrl,
+            studioUrl: null,
+          };
+        }
+      }),
+    );
+
+    return enrichedVideos;
+  }
 }

@@ -1,6 +1,8 @@
 import {
   Controller,
   Post,
+  Get,
+  Delete,
   UseGuards,
   Req,
   Body,
@@ -25,10 +27,11 @@ export class InstagramController {
     @Req() req,
     @Res() res: Response,
     @Param('accountId') accountId: string,
-    @Body() body: InstagramPostDto & { mediaUrl?: string; mediaType?: 'photo' | 'video' | 'carousel' },
+    @Body() body: any,
   ) {
     try {
       console.log(`[Instagram Controller] Creating post for account: ${accountId}, user: ${req.user.id}`);
+      console.log(`[Instagram Controller] Body carouselItems:`, body.carouselItems);
       const result = await this.instagramService.createPost({
         userId: req.user.id,
         socialAccountId: accountId,
@@ -38,6 +41,8 @@ export class InstagramController {
         scheduledPublishTime: body.scheduledPublishTime,
         locationId: body.locationId,
         userTags: body.userTags,
+        carouselUrls: body.carouselUrls,
+        carouselItems: body.carouselItems,
       });
       console.log(`[Instagram Controller] Post created successfully:`, {
         postId: result.postId,
@@ -93,6 +98,45 @@ export class InstagramController {
       };
       
       return res.status(statusCode).json(errorResponse);
+    }
+  }
+
+  @UseGuards(SupabaseAuthGuard)
+  @Get('posts/:accountId')
+  async listPosts(@Req() req, @Param('accountId') accountId: string) {
+    try {
+      console.log(
+        `[Instagram Controller] Listing posts for account: ${accountId}, user: ${req.user.id}`,
+      );
+      return await this.instagramService.listPostsForAccount({
+        userId: req.user.id,
+        socialAccountId: accountId,
+      });
+    } catch (error: any) {
+      console.error('[Instagram Controller] List posts error:', error);
+      throw error;
+    }
+  }
+
+  @UseGuards(SupabaseAuthGuard)
+  @Delete('posts/:accountId/:postId')
+  async deletePost(
+    @Req() req,
+    @Param('accountId') accountId: string,
+    @Param('postId') postId: string,
+  ) {
+    try {
+      console.log(
+        `[Instagram Controller] Deleting post ${postId} for account: ${accountId}, user: ${req.user.id}`,
+      );
+      return await this.instagramService.deletePostForAccount({
+        userId: req.user.id,
+        socialAccountId: accountId,
+        scheduledPostId: postId,
+      });
+    } catch (error: any) {
+      console.error('[Instagram Controller] Delete post error:', error);
+      throw error;
     }
   }
 }

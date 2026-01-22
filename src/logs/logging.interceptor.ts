@@ -22,8 +22,11 @@ export class LoggingInterceptor implements NestInterceptor {
     // Extract user ID from request if available (from auth guard)
     const userId = (request as any).user?.id;
     
-    // Extract account ID from params if available
-    const accountId = request.params?.accountId || request.params?.id;
+    // Extract account ID from params if available (convert array to string if needed)
+    const accountIdRaw = request.params?.accountId || request.params?.id;
+    const accountId: string | undefined = accountIdRaw 
+      ? (Array.isArray(accountIdRaw) ? accountIdRaw[0] : String(accountIdRaw))
+      : undefined;
 
     // Get IP address (check various headers for real IP)
     const ipAddress = 

@@ -167,6 +167,14 @@ export class SocialAccountsController {
   @Delete(':accountId')
   async deleteAccount(@Req() req: Request, @Param('accountId') accountId: string) {
     const user = (req as any).user;
-    return this.socialAccounts.deleteAccount(accountId, user.id);
+    try {
+      console.log(`[Social Accounts Controller] Deleting account: ${accountId}, user: ${user.id}`);
+      const result = await this.socialAccounts.deleteAccount(accountId, user.id);
+      console.log(`[Social Accounts Controller] Account deleted successfully: ${accountId}`);
+      return result;
+    } catch (error: any) {
+      console.error(`[Social Accounts Controller] Error deleting account ${accountId}:`, error.message);
+      throw error;
+    }
   }
 }

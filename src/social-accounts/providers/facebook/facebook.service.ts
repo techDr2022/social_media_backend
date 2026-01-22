@@ -24,8 +24,23 @@ export class FacebookService {
     shareToStory?: boolean;
     privacy?: 'PUBLIC' | 'FRIENDS' | 'CUSTOM';
     privacyValue?: string;
+    isCarousel?: boolean;
+    carouselUrls?: string[];
   }) {
-    const { userId, socialAccountId, message, mediaUrl, mediaType, scheduledPublishTime, collaborator, shareToStory, privacy, privacyValue } = params;
+    const {
+      userId,
+      socialAccountId,
+      message,
+      mediaUrl,
+      mediaType,
+      scheduledPublishTime,
+      collaborator,
+      shareToStory,
+      privacy,
+      privacyValue,
+      isCarousel,
+      carouselUrls,
+    } = params;
 
     // Get account
     const account = await this.prisma.socialAccount.findUnique({
@@ -103,6 +118,10 @@ export class FacebookService {
 
     let postId: string;
 
+    // For carousel posts, store the first image URL so the UI has a thumbnail
+    const finalMediaUrl =
+      isCarousel && carouselUrls && carouselUrls.length > 0 ? carouselUrls[0] : mediaUrl;
+
     try {
       // Verify we can access the page
       try {
@@ -118,26 +137,38 @@ export class FacebookService {
       }
 
       // Helper function to add privacy settings
+      // Note: For Page posts, privacy parameter may not apply the same way as user posts
+      // But we set it to EVERYONE to ensure maximum visibility
       const addPrivacySettings = (data: any, isFormData: boolean = false) => {
-        let privacyValue_str = '';
-        if (privacy === 'FRIENDS') {
-          privacyValue_str = JSON.stringify({ value: 'ALL_FRIENDS' });
-        } else if (privacy === 'CUSTOM' && privacyValue) {
-          // CUSTOM privacy can be: SELF, ALL_FRIENDS, FRIENDS_OF_FRIENDS, CUSTOM
-          // privacyValue can be a friend list ID or comma-separated user IDs
-          privacyValue_str = JSON.stringify({ 
-            value: 'CUSTOM',
-            allow: privacyValue.split(',').map((id: string) => id.trim())
-          });
-        } else {
-          // Default to PUBLIC
-          privacyValue_str = JSON.stringify({ value: 'EVERYONE' });
-        }
-        
         if (isFormData) {
+          // For FormData (photos/videos endpoints), send as JSON string
+          let privacyValue_str = '';
+          if (privacy === 'FRIENDS') {
+            privacyValue_str = JSON.stringify({ value: 'ALL_FRIENDS' });
+          } else if (privacy === 'CUSTOM' && privacyValue) {
+            privacyValue_str = JSON.stringify({ 
+              value: 'CUSTOM',
+              allow: privacyValue.split(',').map((id: string) => id.trim())
+            });
+          } else {
+            // Default to PUBLIC/EVERYONE
+            privacyValue_str = JSON.stringify({ value: 'EVERYONE' });
+          }
           data.append('privacy', privacyValue_str);
         } else {
-          data.privacy = privacyValue_str;
+          // For JSON requests (feed/posts endpoints), send as object
+          // Facebook Graph API expects privacy as an object for JSON requests
+          if (privacy === 'FRIENDS') {
+            data.privacy = { value: 'ALL_FRIENDS' };
+          } else if (privacy === 'CUSTOM' && privacyValue) {
+            data.privacy = { 
+              value: 'CUSTOM',
+              allow: privacyValue.split(',').map((id: string) => id.trim())
+            };
+          } else {
+            // Default to PUBLIC/EVERYONE - this is the correct format for Page posts
+            data.privacy = { value: 'EVERYONE' };
+          }
         }
       };
 
@@ -194,7 +225,101 @@ export class FacebookService {
       }
 
       // Post to Facebook
-      if (mediaType === 'photo' && mediaUrl) {
+      // Handle carousel posts (multiple images)
+      if (isCarousel && carouselUrls && carouselUrls.length >= 2) {
+        console.log(`🎠 Creating carousel post with ${carouselUrls.length} images...`);
+
+        // Facebook carousel: upload each photo as unpublished, then create a feed post with attached_media
+        const photoIds: string[] = [];
+
+        for (let i = 0; i < carouselUrls.length; i++) {
+          const imageUrl = carouselUrls[i];
+          try {
+            console.log(`📤 Uploading carousel photo ${i + 1}/${carouselUrls.length} from URL: ${imageUrl}`);
+            
+            // Validate URL is accessible before sending to Facebook
+            try {
+              const urlCheck = await axios.head(imageUrl, { 
+                timeout: 5000,
+                validateStatus: (status) => status < 500
+              });
+              console.log(`✅ URL accessible, status: ${urlCheck.status}`);
+            } catch (urlErr: any) {
+              console.warn(`⚠️ URL check failed for photo ${i + 1}:`, urlErr.message);
+              // Continue anyway - Facebook will validate it
+            }
+
+            const photoFormData = new FormData();
+            photoFormData.append('url', imageUrl);
+            photoFormData.append('access_token', accessToken);
+            photoFormData.append('published', 'false'); // don't publish individual photos
+
+            const photoRes = await axios.post(
+              `https://graph.facebook.com/v21.0/${pageId}/photos`,
+              photoFormData,
+              {
+                headers: photoFormData.getHeaders(),
+              },
+            );
+
+            if (photoRes.data.id) {
+              photoIds.push(photoRes.data.id);
+              console.log(`✅ Uploaded carousel photo ${i + 1}/${carouselUrls.length}: ${photoRes.data.id}`);
+            } else {
+              console.warn(`⚠️ Photo ${i + 1} uploaded but no ID returned:`, photoRes.data);
+            }
+          } catch (photoErr: any) {
+            const errorDetails = photoErr.response?.data?.error || {};
+            const errorMessage = errorDetails.message || photoErr.message;
+            const errorCode = errorDetails.code;
+            const errorType = errorDetails.type;
+            
+            console.error(`⚠️ Failed to upload carousel photo ${i + 1}:`, {
+              message: errorMessage,
+              code: errorCode,
+              type: errorType,
+              url: imageUrl,
+              fullError: errorDetails
+            });
+          }
+        }
+
+        if (photoIds.length === 0) {
+          throw new Error('Failed to upload any photos for carousel post');
+        }
+
+        const postData: any = {
+          message: message || '',
+          access_token: accessToken,
+          attached_media: photoIds.map((id) => ({ media_fbid: id })),
+        };
+        // NOTE: Do NOT add privacy parameter for Page posts!
+        // Facebook rejects: "Posts where the actor is a page cannot also include privacy"
+        // Page posts are public by default if the Page is public
+
+        if (scheduledTimestamp) {
+          postData.scheduled_publish_time = scheduledTimestamp;
+          postData.published = false;
+        } else {
+          // Explicitly set published: true for immediate posts
+          // Without this, Facebook may leave the post unpublished/draft
+          postData.published = true;
+          // Ensure post is visible on timeline
+          postData.timeline_visibility = 'normal';
+          postData.is_hidden = false;
+        }
+
+        console.log(`📤 Creating carousel post with ${photoIds.length} photos...`);
+        console.log(`👁️ Visibility: published=${postData.published}, timeline_visibility=${postData.timeline_visibility}, is_hidden=${postData.is_hidden}`);
+        console.log(`ℹ️ Note: Privacy parameter NOT used for Page posts (Facebook requirement)`);
+        const feedRes = await axios.post(
+          `https://graph.facebook.com/v21.0/${pageId}/feed`,
+          postData,
+        );
+
+        postId = feedRes.data.id;
+        console.log(`✅ Carousel post created: ${postId}`);
+      } else if (mediaType === 'photo' && mediaUrl) {
         // Validate that the image URL is accessible
         try {
           console.log('🔍 Validating image URL:', mediaUrl);
@@ -213,13 +338,17 @@ export class FacebookService {
         formData.append('message', message || '');
         formData.append('url', mediaUrl);
         formData.append('access_token', accessToken);
-        addPrivacySettings(formData, true);
+        // NOTE: Do NOT add privacy parameter for Page posts!
+        // Facebook rejects: "Posts where the actor is a page cannot also include privacy"
         // Note: Tags/collaborators not supported for photo posts via FormData
         // Skip addCollaborator for FormData posts
 
         if (scheduledTimestamp) {
           formData.append('scheduled_publish_time', scheduledTimestamp.toString());
           formData.append('published', 'false');
+        } else {
+          // Explicitly set published: true for immediate posts
+          formData.append('published', 'true');
         }
 
         console.log('📤 Posting photo to Facebook...');
@@ -239,13 +368,17 @@ export class FacebookService {
         formData.append('description', message || '');
         formData.append('file_url', mediaUrl);
         formData.append('access_token', accessToken);
-        addPrivacySettings(formData, true);
+        // NOTE: Do NOT add privacy parameter for Page posts!
+        // Facebook rejects: "Posts where the actor is a page cannot also include privacy"
         // Note: Tags/collaborators not supported for video posts via FormData
         // Skip addCollaborator for FormData posts
 
         if (scheduledTimestamp) {
           formData.append('scheduled_publish_time', scheduledTimestamp.toString());
           formData.append('published', 'false');
+        } else {
+          // Explicitly set published: true for immediate posts
+          formData.append('published', 'true');
         }
 
         const res = await axios.post(
@@ -263,12 +396,18 @@ export class FacebookService {
           message: message || '',
           access_token: accessToken,
         };
-        addPrivacySettings(postData);
+        // NOTE: Do NOT add privacy parameter for Page posts!
+        // Facebook rejects: "Posts where the actor is a page cannot also include privacy"
         addCollaborator(postData);
 
         if (scheduledTimestamp) {
           postData.scheduled_publish_time = scheduledTimestamp;
           postData.published = false;
+        } else {
+          // Explicitly set published: true for immediate posts
+          postData.published = true;
+          postData.timeline_visibility = 'normal';
+          postData.is_hidden = false;
         }
 
         try {
@@ -300,6 +439,13 @@ export class FacebookService {
           }
         }
       }
+
+      // Log final post result
+      console.log(
+        `✅ Facebook post created for page ${pageId}. Type: ${mediaType || 'text'}, Status: ${
+          scheduledPublishTime ? 'scheduled' : 'immediate'
+        }, Post ID: ${postId}`,
+      );
 
       // Create story separately if requested
       if (shareToStory && mediaUrl && mediaType) {
@@ -397,9 +543,9 @@ export class FacebookService {
           userId,
           socialAccountId,
           platform: 'facebook',
-          type: mediaType || 'text',
-          content: message || '',
-          mediaUrl: mediaUrl || null,
+          type: isCarousel ? 'photo' : (mediaType || 'text'),
+          content: message || (isCarousel ? `Carousel post with ${carouselUrls?.length || 0} images` : ''),
+          mediaUrl: finalMediaUrl || null,
           scheduledAt,
           status: scheduledPublishTime ? 'scheduled' : 'success',
           postedAt: scheduledPublishTime ? null : new Date(),
@@ -424,9 +570,9 @@ export class FacebookService {
           userId,
           socialAccountId,
           platform: 'facebook',
-          type: mediaType || 'text',
-          content: message || '',
-          mediaUrl: mediaUrl || null,
+          type: isCarousel ? 'photo' : (mediaType || 'text'),
+          content: message || (isCarousel ? `Carousel post with ${carouselUrls?.length || 0} images` : ''),
+          mediaUrl: finalMediaUrl || null,
           scheduledAt: scheduledPublishTime ? new Date(scheduledPublishTime) : new Date(),
           status: 'failed',
           externalPostId: null, // Facebook doesn't return postId on error
@@ -460,6 +606,160 @@ export class FacebookService {
 
       throw new InternalServerErrorException(userMessage);
     }
+  }
+
+  /**
+   * List all Facebook posts/uploads for a given account (for the current user)
+   * This returns rows from ScheduledPost table for platform = 'facebook'
+   */
+  async listPostsForAccount(params: {
+    userId: string;
+    socialAccountId: string;
+  }) {
+    const { userId, socialAccountId } = params;
+
+    // Validate account ownership
+    const account = await this.prisma.socialAccount.findUnique({
+      where: { id: socialAccountId },
+    });
+
+    if (!account || account.platform !== 'facebook') {
+      throw new BadRequestException('Invalid Facebook account');
+    }
+
+    if (account.userId !== userId) {
+      throw new BadRequestException('Account does not belong to user');
+    }
+
+    // Return all scheduledPost rows for this user + account + platform
+    const posts = await this.prisma.scheduledPost.findMany({
+      where: {
+        userId,
+        socialAccountId,
+        platform: 'facebook',
+      },
+      orderBy: [
+        // Show most recently created / scheduled first
+        { createdAt: 'desc' },
+      ],
+    });
+
+    return posts;
+  }
+
+  /**
+   * Delete a Facebook post/upload:
+   * - Deletes from Facebook Page via Graph API when externalPostId is present
+   * - Deletes from ScheduledPost table
+   *
+   * Works for:
+   * - Immediately published posts (status = 'success', externalPostId set)
+   * - Facebook-scheduled posts (status = 'scheduled', externalPostId set)
+   * - Failed/other rows (we just remove the DB record)
+   */
+  async deletePostForAccount(params: {
+    userId: string;
+    socialAccountId: string;
+    scheduledPostId: string;
+  }) {
+    const { userId, socialAccountId, scheduledPostId } = params;
+
+    // Validate account
+    const account = await this.prisma.socialAccount.findUnique({
+      where: { id: socialAccountId },
+    });
+
+    if (!account || account.platform !== 'facebook') {
+      throw new BadRequestException('Invalid Facebook account');
+    }
+
+    if (account.userId !== userId) {
+      throw new BadRequestException('Account does not belong to user');
+    }
+
+    // Find the scheduledPost row
+    const post = await this.prisma.scheduledPost.findFirst({
+      where: {
+        id: scheduledPostId,
+        userId,
+        socialAccountId,
+        platform: 'facebook',
+      },
+    });
+
+    if (!post) {
+      throw new BadRequestException('Facebook post not found for this account');
+    }
+
+    const pageId = account.externalId;
+    let fbDeleted = false;
+    let fbErrorMessage: string | null = null;
+
+    // If we have an externalPostId, try to delete from Facebook as well
+    if (post.externalPostId) {
+      try {
+        const accessToken =
+          await this.socialAccountsService.getValidFacebookAccessToken(
+            account.id,
+          );
+
+        console.log(
+          `🗑️ Deleting Facebook post ${post.externalPostId} for page ${pageId}`,
+        );
+
+        const fbRes = await axios.delete(
+          `https://graph.facebook.com/v21.0/${post.externalPostId}`,
+          {
+            params: {
+              access_token: accessToken,
+            },
+          },
+        );
+
+        // Facebook returns either { success: true } or boolean true
+        fbDeleted = Boolean(
+          (fbRes.data && fbRes.data.success) || fbRes.data === true,
+        );
+
+        console.log(
+          `✅ Facebook Graph delete result for ${post.externalPostId}:`,
+          fbRes.data,
+        );
+      } catch (err: any) {
+        const fbError = err.response?.data?.error;
+        fbErrorMessage =
+          fbError?.message ||
+          err.message ||
+          'Unknown error while deleting Facebook post';
+
+        console.warn(
+          `⚠️ Failed to delete Facebook post ${post.externalPostId}:`,
+          fbErrorMessage,
+        );
+
+        // Even if Facebook delete fails (already deleted, permissions, etc),
+        // we will still remove the record from our database so the UI is clean.
+      }
+    } else {
+      console.log(
+        `ℹ️ ScheduledPost ${post.id} has no externalPostId; deleting only from local database.`,
+      );
+    }
+
+    // Remove from our database
+    await this.prisma.scheduledPost.delete({
+      where: { id: post.id },
+    });
+
+    return {
+      success: true,
+      fbDeleted,
+      message: fbDeleted
+        ? 'Post deleted from Facebook and removed from history'
+        : post.externalPostId
+        ? 'Post removed from history. Facebook delete may have failed or the post was already removed on Facebook.'
+        : 'Post removed from history (no Facebook post ID was stored).',
+    };
   }
 }
 
