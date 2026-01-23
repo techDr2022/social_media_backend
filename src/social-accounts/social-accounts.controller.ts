@@ -9,14 +9,19 @@ import {
   Res,
   UseGuards,
   BadRequestException,
+  Query,
 } from '@nestjs/common';
 import { SupabaseAuthGuard } from '../auth/supabase.guard';
 import { SocialAccountsService } from './social-accounts.service';
 import type { Request, Response } from 'express';
+import { YoutubeService } from './providers/youtube/youtube.service';
 
 @Controller('social-accounts')
 export class SocialAccountsController {
-  constructor(private readonly socialAccounts: SocialAccountsService) {}
+  constructor(
+    private readonly socialAccounts: SocialAccountsService,
+    private readonly youtubeService: YoutubeService,
+  ) {}
 
   // START YOUTUBE OAUTH
   @UseGuards(SupabaseAuthGuard)
@@ -50,6 +55,41 @@ export class SocialAccountsController {
   async testUpload(@Req() req: Request) {
     const user = (req as any).user;
     return this.socialAccounts.testYoutubeUpload(user.id);
+  }
+
+  // YOUTUBE STATISTICS
+  @UseGuards(SupabaseAuthGuard)
+  @Get('youtube/:accountId/statistics')
+  async getYoutubeStatistics(
+    @Req() req: Request,
+    @Param('accountId') accountId: string,
+  ) {
+    const user = (req as any).user;
+    return this.youtubeService.getYoutubeStatistics({
+      userId: user.id,
+      socialAccountId: accountId,
+    });
+  }
+
+  // YOUTUBE RECENT VIDEOS
+  @UseGuards(SupabaseAuthGuard)
+  @Get('youtube/:accountId/videos')
+  async getYoutubeVideos(
+    @Req() req: Request,
+    @Param('accountId') accountId: string,
+    @Query('page') page = '1',
+    @Query('limit') limit = '10',
+  ) {
+    const user = (req as any).user;
+    const pageNum = Number(page) || 1;
+    const limitNum = Number(limit) || 10;
+
+    return this.youtubeService.getRecentYoutubeVideos({
+      userId: user.id,
+      socialAccountId: accountId,
+      page: pageNum,
+      limit: limitNum,
+    });
   }
 
   // START FACEBOOK OAUTH
