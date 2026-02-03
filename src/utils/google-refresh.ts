@@ -1,19 +1,17 @@
 import axios from 'axios';
+import { TokenRefreshService } from './token-refresh.service';
 
+/**
+ * Legacy function for backward compatibility
+ * @deprecated Use TokenRefreshService instead
+ */
 export async function refreshGoogleToken(refreshToken: string) {
-  const res = await axios.post(
-    'https://oauth2.googleapis.com/token',
-    {
-      client_id: process.env.GOOGLE_OAUTH_CLIENT_ID,
-      client_secret: process.env.GOOGLE_OAUTH_CLIENT_SECRET,
-      refresh_token: refreshToken,
-      grant_type: 'refresh_token',
-    },
-    { headers: { 'Content-Type': 'application/json' } }
-  );
-
+  // Use the new service for consistency
+  const service = new TokenRefreshService();
+  const result = await service.refreshGoogleToken(refreshToken);
+  
   return {
-    accessToken: res.data.access_token,
-    expiresIn: res.data.expires_in,
+    accessToken: result.accessToken,
+    expiresIn: result.expiresIn,
   };
 }

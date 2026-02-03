@@ -6,12 +6,14 @@ import { CreateScheduledPostDto } from './dto/create-scheduled-post.dto';
 import { UpdateScheduledPostDto } from './dto/update-scheduled-post.dto';
 import { PublishPostJobData } from './queue/post-queue.types';
 import { QUEUE_NAMES, JOB_NAMES } from './queue/post-queue.types';
+import { QueueHelpers } from './queue/queue-helpers';
 
 @Injectable()
 export class ScheduledPostsService {
   constructor(
     private readonly prisma: PrismaService,
     @InjectQueue(QUEUE_NAMES.POST_PUBLISH) private readonly postQueue: Queue,
+    private readonly queueHelpers: QueueHelpers,
   ) {}
 
   async create(userId: string, dto: CreateScheduledPostDto, media?: { url: string; filename: string; mimeType?: string; size?: number }) {
@@ -105,40 +107,23 @@ export class ScheduledPostsService {
       // If scheduled time changed and post is still pending, update the job in queue
       if (existing.status === 'pending') {
         const newScheduledAt = data.scheduledAt;
-        const now = new Date();
-        const delay = newScheduledAt.getTime() - now.getTime();
         
-        if (delay > 0) {
-          try {
-            // Remove old job
-            const oldJob = await this.postQueue.getJob(`post-${id}`);
-            if (oldJob) {
-              await oldJob.remove();
-            }
-            
-            // Add new job with updated time
-            const jobData: PublishPostJobData = {
-              postId: id,
-              userId: existing.userId,
-              socialAccountId: existing.socialAccountId,
-              platform: existing.platform as 'instagram' | 'facebook' | 'youtube',
-              content: existing.content,
-              mediaUrl: existing.mediaUrl || undefined,
-              mediaType: existing.type || undefined,
-            };
-            
-            await this.postQueue.add(
-              JOB_NAMES.PUBLISH_POST,
-              jobData,
-              {
-                delay: delay,
-                jobId: `post-${id}`,
-              }
-            );
-          } catch (error) {
-            // If queue update fails, continue with database update
-            console.error('Failed to update job in queue:', error);
-          }
+        try {
+          // Use QueueHelpers to reschedule
+          const jobData: PublishPostJobData = {
+            postId: id,
+            userId: existing.userId,
+            socialAccountId: existing.socialAccountId,
+            platform: existing.platform as 'instagram' | 'facebook' | 'youtube',
+            content: existing.content,
+            mediaUrl: existing.mediaUrl || undefined,
+            mediaType: existing.type || undefined,
+          };
+          
+          await this.queueHelpers.reschedulePost(id, newScheduledAt, jobData);
+        } catch (error) {
+          // If queue update fails, continue with database update
+          console.error('Failed to update job in queue:', error);
         }
       }
     }
@@ -155,18 +140,18 @@ export class ScheduledPostsService {
     
     // Remove job from queue if still pending
     if (existing.status === 'pending') {
-      try {
-        const job = await this.postQueue.getJob(`post-${id}`);
-        if (job) {
-          await job.remove();
-        }
-      } catch (error) {
-        // If queue removal fails, continue with database delete
-        console.error('Failed to remove job from queue:', error);
-      }
+      await this.queueHelpers.removeJob(id);
     }
     
     await this.prisma.scheduledPost.delete({ where: { id } });
     return { success: true };
   }
+
+  /**
+   * Get queue statistics
+   */
+  async getQueueStats() {
+    return await this.queueHelpers.getQueueStats();
+  }
+
 }

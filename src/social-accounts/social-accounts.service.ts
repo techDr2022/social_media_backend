@@ -1,6 +1,7 @@
 // src/social-accounts/social-accounts.service.ts
-import { Injectable, BadRequestException } from '@nestjs/common';
+import { Injectable, BadRequestException, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
+import { TokenRefreshService } from '../utils/token-refresh.service';
 import axios from 'axios';
 import * as fs from 'fs';
 import FormData from 'form-data';
@@ -8,7 +9,12 @@ import { refreshGoogleToken } from '../utils/google-refresh';
 
 @Injectable()
 export class SocialAccountsService {
-  constructor(private readonly prisma: PrismaService) {}
+  private readonly logger = new Logger(SocialAccountsService.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly tokenRefresh: TokenRefreshService,
+  ) {}
 
   // ---- OAUTH ----
 
@@ -25,23 +31,35 @@ async getValidYoutubeAccessToken(socialAccountId: string) {
     throw new Error('Missing refresh token');
   }
 
-  let accessToken = account.accessToken;
+  // Use TokenRefreshService for automatic refresh with retry logic
+  const accessToken = await this.tokenRefresh.getValidToken(
+    account.platform,
+    account.refreshToken,
+    account.accessToken,
+    account.tokenExpiresAt,
+  );
 
-  if (!account.tokenExpiresAt || account.tokenExpiresAt <= new Date()) {
-    const refreshed = await refreshGoogleToken(account.refreshToken);
+  // Update token if it was refreshed
+  const bufferTime = 5 * 60 * 1000; // 5 minutes
+  const isExpired = !account.tokenExpiresAt || 
+    account.tokenExpiresAt.getTime() <= Date.now() + bufferTime;
 
-    accessToken = refreshed.accessToken;
-
+  if (isExpired || accessToken !== account.accessToken) {
+    const refreshed = await this.tokenRefresh.refreshGoogleToken(account.refreshToken);
+    
     await this.prisma.socialAccount.update({
       where: { id: account.id },
       data: {
         accessToken: refreshed.accessToken,
-        tokenExpiresAt: new Date(Date.now() + refreshed.expiresIn * 1000),
+        tokenExpiresAt: refreshed.expiresAt,
       },
     });
+    
+    this.logger.log(`✅ Refreshed YouTube token for account ${account.id}`);
+    return refreshed.accessToken;
   }
-  console.log('Using YouTube access token, expires at:', account.tokenExpiresAt);
 
+  this.logger.log(`Using YouTube access token, expires at: ${account.tokenExpiresAt}`);
   return accessToken;
 }
 

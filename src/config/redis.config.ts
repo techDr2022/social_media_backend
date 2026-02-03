@@ -15,18 +15,32 @@ export interface RedisConfig {
 }
 
 export function getRedisConfig(): RedisConfig {
-  // Priority 1: Use REDIS_URL if provided (Railway/Cloud format)
-  if (process.env.REDIS_URL) {
+  // Priority 1: Use REDIS_PUBLIC_URL for local development (if REDIS_URL is internal)
+  // This handles Railway internal URLs that aren't accessible locally
+  const redisUrl = process.env.REDIS_URL;
+  const redisPublicUrl = process.env.REDIS_PUBLIC_URL;
+  const isRailwayInternal = redisUrl?.includes('railway.internal');
+  const isLocalDev = process.env.NODE_ENV !== 'production' || !process.env.RAILWAY_ENVIRONMENT;
+
+  // If we have a public URL and we're in local dev with an internal URL, use public
+  if (isLocalDev && isRailwayInternal && redisPublicUrl) {
     return {
-      url: process.env.REDIS_URL,
+      url: redisPublicUrl,
     };
   }
 
-  // Priority 2: Use separate variables (local development)
+  // Priority 2: Use REDIS_URL if provided (Railway/Cloud format)
+  if (redisUrl) {
+    return {
+      url: redisUrl,
+    };
+  }
+
+  // Priority 3: Use separate variables (local development)
   return {
-    host: process.env.REDIS_HOST || 'localhost',
-    port: parseInt(process.env.REDIS_PORT || '6379', 10),
-    password: process.env.REDIS_PASSWORD || undefined,
+    host: process.env.REDIS_HOST || process.env.REDISHOST || 'localhost',
+    port: parseInt(process.env.REDIS_PORT || process.env.REDISPORT || '6379', 10),
+    password: process.env.REDIS_PASSWORD || process.env.REDISPASSWORD || undefined,
     db: parseInt(process.env.REDIS_DB || '0', 10),
   };
 }
@@ -42,6 +56,8 @@ export function getBullMQRedisConfig() {
     return {
       connection: {
         url: config.url,
+        maxRetriesPerRequest: null, // Required for BullMQ
+        enableReadyCheck: false,
       },
     };
   }
@@ -53,9 +69,14 @@ export function getBullMQRedisConfig() {
       port: config.port,
       password: config.password,
       db: config.db,
+      maxRetriesPerRequest: null, // Required for BullMQ
+      enableReadyCheck: false,
     },
   };
 }
+
+
+
 
 
 

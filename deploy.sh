@@ -96,3 +96,6 @@ echo -e "   aws logs tail /ecs/$ECR_REPO --follow --region $AWS_REGION"
 
 
 
+
+
+

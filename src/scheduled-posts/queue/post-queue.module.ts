@@ -4,10 +4,13 @@ import { getBullMQRedisConfig } from '../../config/redis.config';
 import { QUEUE_NAMES } from './post-queue.types';
 import { PostProcessor } from './post-processor';
 import { MediaHandler } from './media-handler';
+import { QueueHelpers } from './queue-helpers';
+import { JobTrackerService } from './job-tracker.service';
 import { PrismaModule } from '../../prisma/prisma.module';
 import { InstagramModule } from '../../social-accounts/providers/instagram/instagram.module';
 import { FacebookModule } from '../../social-accounts/providers/facebook/facebook.module';
 import { YoutubeModule } from '../../social-accounts/providers/youtube/youtube.module';
+import { RedisConnectionService } from '../../config/redis-connection.service';
 
 /**
  * Post Queue Module
@@ -57,8 +60,14 @@ import { YoutubeModule } from '../../social-accounts/providers/youtube/youtube.m
     FacebookModule, // For FacebookService
     YoutubeModule, // For YoutubeService
   ],
-  providers: [PostProcessor, MediaHandler],
-  exports: [BullModule],
+  providers: [
+    PostProcessor,
+    MediaHandler,
+    QueueHelpers, // ⭐ New: Queue helper functions
+    JobTrackerService, // ⭐ New: Job tracking service
+    RedisConnectionService, // ⭐ New: Redis connection service
+  ],
+  exports: [BullModule, QueueHelpers, JobTrackerService, RedisConnectionService],
 })
 export class PostQueueModule {}
 

@@ -34,6 +34,12 @@ model SocialAccount {
   updatedAt      DateTime        @updatedAt
   scheduledPosts ScheduledPost[]
   user           User            @relation(fields: [userId], references: [id])
+
+  // ⭐ Optimized indexes for common queries
+  @@index([userId, platform]) // User + platform queries
+  @@index([isActive, tokenExpiresAt]) // For token refresh queries
+  @@index([platform, isActive]) // Platform-specific active accounts
+  @@index([userId]) // User queries
 }
 
 model ScheduledPost {
@@ -56,6 +62,13 @@ model ScheduledPost {
   updatedAt       DateTime      @updatedAt
   socialAccount   SocialAccount @relation(fields: [socialAccountId], references: [id])
   user            User          @relation(fields: [userId], references: [id])
+
+  // ⭐ Optimized indexes for common queries
+  @@index([userId, status, scheduledAt]) // Composite index for user queries
+  @@index([platform, status]) // For platform-specific queries
+  @@index([scheduledAt, status]) // For scheduler queries
+  @@index([socialAccountId, status]) // For account queries
+  @@index([status]) // For status filtering
 }
 
 model Plan {
