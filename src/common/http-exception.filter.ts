@@ -43,8 +43,14 @@ export class HttpExceptionFilter implements ExceptionFilter {
       // Explicitly set Content-Type header to ensure JSON response
       response.setHeader('Content-Type', 'application/json');
       response.status(status).json(errorResponse);
-      
-      console.log(`[HttpExceptionFilter] Sent error response: ${status}, path: ${request.url}`);
+
+      // Skip logging 401 for polling endpoints to avoid console spam (token expired / unauthenticated)
+      const path = request.url?.split('?')[0] || '';
+      if (status === 401 && path.endsWith('/alerts/unread-count')) {
+        // 401 on unread-count is expected when token is expired; don't log every poll
+      } else {
+        console.log(`[HttpExceptionFilter] Sent error response: ${status}, path: ${request.url}`);
+      }
     } catch (sendError: any) {
       // If sending response fails (e.g., headers already sent), log but don't crash
       console.error('[HttpExceptionFilter] Failed to send error response:', sendError.message);

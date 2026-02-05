@@ -8,6 +8,7 @@ import { YoutubeService } from '../../social-accounts/providers/youtube/youtube.
 import { MediaHandler } from './media-handler';
 import { PublishPostJobData, PublishPostJobResult } from './post-queue.types';
 import { JOB_NAMES, QUEUE_NAMES } from './post-queue.types';
+import { AlertsService } from '../../alerts/alerts.service';
 
 /**
  * Post Processor (Worker)
@@ -36,6 +37,7 @@ export class PostProcessor {
     private readonly facebookService: FacebookService,
     private readonly youtubeService: YoutubeService,
     private readonly mediaHandler: MediaHandler,
+    private readonly alertsService: AlertsService,
   ) {}
 
   /**
@@ -58,12 +60,54 @@ export class PostProcessor {
       `[Job ${job.id}] Processing scheduled post ${postId} for platform ${platform}`,
     );
 
+    // Get scheduled post and account info for alerts (outside try block so it's accessible in catch)
+    let scheduledPost: any = null;
+    let accountName = `${platform} Account`;
+    let postType: 'photo' | 'video' | 'carousel' = 'photo';
+
     try {
+      scheduledPost = await this.prisma.scheduledPost.findUnique({
+        where: { id: postId },
+        include: {
+          socialAccount: true,
+        },
+      });
+
+      const account = scheduledPost?.socialAccount;
+      accountName = account?.displayName || account?.username || `${platform} Account`;
+      postType = (mediaType || scheduledPost?.type || 'photo') as 'photo' | 'video' | 'carousel';
+    } catch (fetchError: any) {
+      // If we can't fetch scheduled post, continue with defaults
+      this.logger.warn(`Failed to fetch scheduled post for alerts: ${fetchError.message}`);
+    }
+
+    try {
+
       // 1. Update status to 'processing'
       await this.updatePostStatus(postId, 'processing', {
         jobId: job.id.toString(),
         startedAt: new Date(),
       });
+
+      // Create processing alert
+      try {
+        const message = this.alertsService.formatProcessingMessage(accountName, postType);
+        await this.alertsService.create({
+          userId,
+          socialAccountId,
+          scheduledPostId: postId,
+          type: 'processing',
+          platform: platform as 'instagram' | 'facebook' | 'youtube',
+          title: 'Processing',
+          message,
+          accountName,
+          postType,
+          scheduledAt: scheduledPost?.scheduledAt || null,
+        });
+      } catch (alertError: any) {
+        // Don't fail the job if alert creation fails
+        this.logger.warn(`Failed to create processing alert: ${alertError.message}`);
+      }
 
       // 2. Handle media (verify accessibility)
       let processedMediaUrl = mediaUrl;
@@ -94,6 +138,10 @@ export class PostProcessor {
             content,
             mediaUrl: processedMediaUrl,
             mediaType,
+            carouselItems: job.data.carouselItems,
+            carouselUrls: job.data.carouselUrls,
+            locationId: job.data.locationId,
+            userTags: job.data.userTags,
           });
           break;
           
@@ -132,6 +180,26 @@ export class PostProcessor {
         completedAt: new Date(),
       });
 
+      // Create success alert
+      try {
+        const message = this.alertsService.formatSuccessMessage(accountName, postType, result.postUrl || undefined);
+        await this.alertsService.create({
+          userId,
+          socialAccountId,
+          scheduledPostId: postId,
+          type: 'success',
+          platform: platform as 'instagram' | 'facebook' | 'youtube',
+          title: 'Success',
+          message,
+          accountName,
+          postType,
+          scheduledAt: scheduledPost?.scheduledAt || null,
+        });
+      } catch (alertError: any) {
+        // Don't fail the job if alert creation fails
+        this.logger.warn(`Failed to create success alert: ${alertError.message}`);
+      }
+
       this.logger.log(
         `[Job ${job.id}] Successfully published post ${postId} in ${processingTime}ms`,
       );
@@ -159,6 +227,40 @@ export class PostProcessor {
         maxAttempts: job.opts.attempts || 3,
       });
 
+      // Create failed alert (only on final attempt to avoid spam)
+      const isFinalAttempt = (job.attemptsMade + 1) >= (job.opts.attempts || 3);
+      if (isFinalAttempt) {
+        try {
+          // Use account info already fetched, or fetch if not available
+          if (!scheduledPost?.socialAccount) {
+            const account = await this.prisma.socialAccount.findUnique({
+              where: { id: socialAccountId },
+            });
+            accountName = account?.displayName || account?.username || `${platform} Account`;
+          }
+          if (!scheduledPost) {
+            postType = (mediaType || 'photo') as 'photo' | 'video' | 'carousel';
+          }
+
+          const message = this.alertsService.formatFailedMessage(accountName, postType, errorMessage);
+          await this.alertsService.create({
+            userId,
+            socialAccountId,
+            scheduledPostId: postId,
+            type: 'failed',
+            platform: platform as 'instagram' | 'facebook' | 'youtube',
+            title: 'Failed',
+            message,
+            accountName,
+            postType,
+            scheduledAt: scheduledPost?.scheduledAt || null,
+          });
+        } catch (alertError: any) {
+          // Don't fail the job if alert creation fails
+          this.logger.warn(`Failed to create failed alert: ${alertError.message}`);
+        }
+      }
+
       // Re-throw to trigger BullMQ retry mechanism
       throw error;
     }
@@ -173,11 +275,19 @@ export class PostProcessor {
     content: string;
     mediaUrl?: string;
     mediaType?: string;
+    carouselItems?: Array<{url: string; type: 'photo' | 'video'}> | any; // Allow any to catch serialization issues
+    carouselUrls?: string[];
+    locationId?: string;
+    userTags?: string;
   }): Promise<PublishPostJobResult> {
     let caption = params.content;
-    let mediaType: 'photo' | 'video' | undefined;
+
+    // Start from mediaType coming from the job (ScheduledPost.type)
+    let mediaType: 'photo' | 'video' | 'carousel' | undefined =
+      (params.mediaType as 'photo' | 'video' | 'carousel' | undefined) || undefined;
     
-    // Parse content if it's JSON (for YouTube-style posts)
+    // 1) Parse content if it's JSON (multi-platform payload)
+    //    This can override caption and mediaType if explicitly provided
     try {
       const parsed = JSON.parse(params.content);
       if (parsed.caption) caption = parsed.caption;
@@ -186,12 +296,74 @@ export class PostProcessor {
       // Content is plain text, use as-is
     }
 
+    // 2) Normalize carouselItems - handle serialization issues
+    //    Sometimes carouselItems comes as a number (count) instead of array
+    let normalizedCarouselItems: Array<{url: string; type: 'photo' | 'video'}> | undefined = undefined;
+    let normalizedCarouselUrls: string[] | undefined = undefined;
+
+    if (params.carouselItems) {
+      // Check if it's actually an array
+      if (Array.isArray(params.carouselItems)) {
+        // Validate array items have required structure
+        normalizedCarouselItems = params.carouselItems.filter((item: any) => 
+          item && typeof item === 'object' && item.url && typeof item.url === 'string'
+        ) as Array<{url: string; type: 'photo' | 'video'}>;
+        
+        if (normalizedCarouselItems.length === 0) {
+          this.logger.warn(`[Job] carouselItems array is empty or invalid, ignoring`);
+          normalizedCarouselItems = undefined;
+        }
+      } else if (typeof params.carouselItems === 'number') {
+        // If it's a number (count), log warning but don't use it
+        this.logger.warn(`[Job] carouselItems is a number (${params.carouselItems}) instead of array - this indicates a data issue`);
+        normalizedCarouselItems = undefined;
+      } else {
+        this.logger.warn(`[Job] carouselItems has unexpected type: ${typeof params.carouselItems}, ignoring`);
+        normalizedCarouselItems = undefined;
+      }
+    }
+
+    if (params.carouselUrls) {
+      if (Array.isArray(params.carouselUrls)) {
+        normalizedCarouselUrls = params.carouselUrls.filter((url: any) => 
+          url && typeof url === 'string' && url.trim().length > 0
+        );
+        if (normalizedCarouselUrls.length === 0) {
+          normalizedCarouselUrls = undefined;
+        }
+      }
+    }
+
+    // 3) Infer mediaType when missing or wrong
+    //    - If we have valid carousel items/urls → 'carousel'
+    //    - Else, infer from mediaUrl file extension (mp4/mov → video, otherwise photo)
+    if (!mediaType) {
+      const hasCarousel =
+        (normalizedCarouselItems && normalizedCarouselItems.length > 0) ||
+        (normalizedCarouselUrls && normalizedCarouselUrls.length > 0);
+
+      if (hasCarousel) {
+        mediaType = 'carousel';
+      } else if (params.mediaUrl) {
+        const url = params.mediaUrl.toLowerCase().split('?')[0];
+        if (url.endsWith('.mp4') || url.endsWith('.mov')) {
+          mediaType = 'video';
+        } else {
+          mediaType = 'photo';
+        }
+      }
+    }
+
     const result = await this.instagramService.createPost({
       userId: params.userId,
       socialAccountId: params.socialAccountId,
       caption: caption,
       mediaUrl: params.mediaUrl,
-      mediaType: mediaType || (params.mediaUrl ? 'photo' : undefined),
+      mediaType: mediaType,
+      carouselItems: normalizedCarouselItems, // Use normalized version
+      carouselUrls: normalizedCarouselUrls, // Use normalized version
+      locationId: params.locationId,
+      userTags: params.userTags,
       // No scheduledPublishTime - we're publishing now!
     });
 

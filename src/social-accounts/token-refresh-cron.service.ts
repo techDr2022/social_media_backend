@@ -3,14 +3,13 @@ import { Cron, CronExpression } from '@nestjs/schedule';
 import { PrismaService } from '../prisma/prisma.service';
 import { TokenRefreshService } from '../utils/token-refresh.service';
 import { TokenExpirationService } from './token-expiration.service';
+import { EncryptionService } from '../common/encryption.service';
 
 /**
  * Token Refresh Cron Service
- * 
- * Automatically refreshes expiring OAuth tokens:
- * - Runs every hour
- * - Finds tokens expiring within 30 minutes
- * - Refreshes them proactively
+ *
+ * Automatically refreshes expiring OAuth tokens.
+ * Decrypts tokens when reading; encrypts when saving.
  */
 @Injectable()
 export class TokenRefreshCronService {
@@ -20,6 +19,7 @@ export class TokenRefreshCronService {
     private readonly prisma: PrismaService,
     private readonly tokenRefresh: TokenRefreshService,
     private readonly tokenExpiration: TokenExpirationService,
+    private readonly encryption: EncryptionService,
   ) {}
 
   /**
@@ -71,7 +71,10 @@ export class TokenRefreshCronService {
 
       for (const account of expiringAccounts) {
         try {
-          if (!account.refreshToken) {
+          const refreshToken = this.encryption.decrypt(account.refreshToken);
+          const accessToken = this.encryption.decrypt(account.accessToken);
+
+          if (!refreshToken) {
             this.logger.warn(
               `⚠️ Account ${account.id} has no refresh token, skipping`,
             );
@@ -82,9 +85,7 @@ export class TokenRefreshCronService {
 
           // Refresh based on platform
           if (account.platform === 'youtube' || account.platform === 'google') {
-            refreshed = await this.tokenRefresh.refreshGoogleToken(
-              account.refreshToken,
-            );
+            refreshed = await this.tokenRefresh.refreshGoogleToken(refreshToken);
           } else if (
             account.platform === 'facebook' ||
             account.platform === 'instagram'
@@ -100,7 +101,7 @@ export class TokenRefreshCronService {
             }
 
             refreshed = await this.tokenRefresh.refreshFacebookToken(
-              account.accessToken || account.refreshToken,
+              accessToken || refreshToken,
               process.env.FACEBOOK_APP_ID,
               process.env.FACEBOOK_APP_SECRET,
             );
@@ -111,11 +112,11 @@ export class TokenRefreshCronService {
             continue;
           }
 
-          // Update account with new token
+          // Update account with new token (encrypt before storing)
           await this.prisma.socialAccount.update({
             where: { id: account.id },
             data: {
-              accessToken: refreshed.accessToken,
+              accessToken: this.encryption.encrypt(refreshed.accessToken),
               tokenExpiresAt: refreshed.expiresAt,
             },
           });

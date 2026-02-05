@@ -7,20 +7,23 @@ import { PrismaModule } from '../prisma/prisma.module';
 import { UsersModule } from '../users/users.module';
 import { YoutubeModule } from './providers/youtube/youtube.module';
 import { TokenRefreshService } from '../utils/token-refresh.service';
+import { EncryptionService } from '../common/encryption.service';
 
 @Module({
   imports: [PrismaModule, UsersModule, forwardRef(() => YoutubeModule)],
   controllers: [SocialAccountsController],
   providers: [
     SocialAccountsService,
-    TokenExpirationService, // ⭐ New: Token expiration tracking
-    TokenRefreshCronService, // ⭐ New: Scheduled token refresh
-    TokenRefreshService, // ⭐ New: Enhanced token refresh service
+    TokenExpirationService,
+    TokenRefreshCronService,
+    TokenRefreshService,
+    EncryptionService,
   ],
   exports: [
     SocialAccountsService,
     TokenExpirationService,
     TokenRefreshService,
+    EncryptionService,
   ],
 })
 export class SocialAccountsModule {}

@@ -1,14 +1,30 @@
+import 'dotenv/config';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
 import { ValidationPipe } from '@nestjs/common';
 import * as express from 'express';
 import cookieParser from 'cookie-parser';
+import helmet from 'helmet';
+import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { HttpExceptionFilter } from './common/http-exception.filter';
 import { TimeoutInterceptor } from './common/timeout.interceptor';
 import { LogsService } from './logs/logs.service';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
+  
+  // Security middleware - must be before other middleware
+  app.use(helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        scriptSrc: ["'self'"],
+        imgSrc: ["'self'", "data:", "https:"],
+      },
+    },
+    crossOriginEmbedderPolicy: false, // Allow iframe embeds if needed
+  }));
   
   // Global prefix for API versioning
   app.setGlobalPrefix('api/v1');
@@ -87,8 +103,41 @@ async function bootstrap() {
   process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
   process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
-  await app.listen(3000);
-  console.log(`✅ Nest API running on http://localhost:3000`);
-  console.log(`📊 Health check: http://localhost:3000/api/v1/health`);
+  // Swagger/OpenAPI Documentation
+  const config = new DocumentBuilder()
+    .setTitle('Social Media API')
+    .setDescription('API for managing social media posts and accounts across Instagram, Facebook, and YouTube')
+    .setVersion('1.0')
+    .addBearerAuth(
+      {
+        type: 'http',
+        scheme: 'bearer',
+        bearerFormat: 'JWT',
+        name: 'JWT',
+        description: 'Enter JWT token',
+        in: 'header',
+      },
+      'JWT-auth', // This name here is important for matching up with @ApiBearerAuth() in your controller!
+    )
+    .addTag('auth', 'Authentication endpoints')
+    .addTag('users', 'User management')
+    .addTag('social-accounts', 'Social account management')
+    .addTag('scheduled-posts', 'Post scheduling and management')
+    .addTag('health', 'Health check endpoints')
+    .addTag('logs', 'Logging endpoints')
+    .build();
+  
+  const document = SwaggerModule.createDocument(app, config);
+  SwaggerModule.setup('api/docs', app, document, {
+    swaggerOptions: {
+      persistAuthorization: true, // Keep auth token in browser
+    },
+  });
+
+  const port = process.env.PORT || 3000;
+  await app.listen(port);
+  console.log(`✅ Nest API running on http://localhost:${port}`);
+  console.log(`📊 Health check: http://localhost:${port}/api/v1/health`);
+  console.log(`📚 API Documentation: http://localhost:${port}/api/docs`);
 }
 bootstrap();

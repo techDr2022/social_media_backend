@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { ConfigModule } from '@nestjs/config';
 import { join } from 'path';
 import { ServeStaticModule } from '@nestjs/serve-static';
 import { ScheduleModule } from '@nestjs/schedule';
@@ -22,9 +23,14 @@ import { CircuitBreakerService } from './common/circuit-breaker.service';
 import { CacheService } from './common/cache.service';
 import { QueryOptimizerService } from './common/query-optimizer.service';
 import { PostQueueModule } from './scheduled-posts/queue/post-queue.module';
+import { AlertsModule } from './alerts/alerts.module';
 
 @Module({
   imports: [
+    ConfigModule.forRoot({
+      isGlobal: true, // Make config available throughout the app
+      envFilePath: ['.env.local', '.env'], // Load .env.local first, then .env
+    }),
     ScheduleModule.forRoot(), // ⭐ Enable cron jobs
     ServeStaticModule.forRoot({
       rootPath: join(__dirname, '..', 'uploads'),
@@ -41,6 +47,7 @@ import { PostQueueModule } from './scheduled-posts/queue/post-queue.module';
     InstagramModule,
     LogsModule,
     HealthModule,
+    AlertsModule, // ⭐ Alerts/notifications module
   ],
   controllers: [AppController],
   providers: [

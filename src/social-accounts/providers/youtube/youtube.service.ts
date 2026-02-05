@@ -1,15 +1,18 @@
-import { Injectable, BadRequestException, InternalServerErrorException } from '@nestjs/common';
+import { Injectable, BadRequestException, InternalServerErrorException, Inject, forwardRef } from '@nestjs/common';
 import axios from 'axios';
 import * as fs from 'fs';
 import FormData from 'form-data';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { SocialAccountsService } from '../../social-accounts.service';
+import { AlertsService } from '../../../alerts/alerts.service';
 
 @Injectable()
 export class YoutubeService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly socialAccountsService: SocialAccountsService,
+    @Inject(forwardRef(() => AlertsService))
+    private readonly alertsService: AlertsService,
   ) {}
 
   async uploadVideo(params: {
@@ -90,7 +93,7 @@ export class YoutubeService {
           ...(videoId && { videoId, channelId: account.externalId }),
         };
 
-        await this.prisma.scheduledPost.create({
+        return await this.prisma.scheduledPost.create({
           data: {
             userId,
             socialAccountId,
@@ -107,6 +110,7 @@ export class YoutubeService {
       } catch (dbErr: any) {
         // Log but don't fail the upload if database save fails
         console.error('Failed to save upload to database:', dbErr.message);
+        return null;
       }
     };
 
@@ -309,7 +313,40 @@ export class YoutubeService {
       }
 
       // Save to ScheduledPost table after successful upload
-      await saveToDatabase('success', videoId);
+      const scheduledPost = await saveToDatabase('success', videoId);
+
+      // Create alert for scheduled post (YouTube uses native scheduling)
+      if (publishAt && scheduledPost) {
+        try {
+          const accountName = account.displayName || account.username || 'YouTube Channel';
+          const scheduledAt = new Date(publishAt);
+          const formattedDate = scheduledAt.toLocaleString('en-US', {
+            month: 'short',
+            day: 'numeric',
+            year: 'numeric',
+            hour: 'numeric',
+            minute: '2-digit',
+            hour12: true,
+          });
+          const message = `Your video post for ${accountName} is scheduled for ${formattedDate}. Post scheduled through the app.`;
+
+          await this.alertsService.create({
+            userId,
+            socialAccountId,
+            scheduledPostId: scheduledPost.id,
+            type: 'scheduled',
+            platform: 'youtube',
+            title: 'Scheduled Successfully',
+            message,
+            accountName,
+            postType: 'video',
+            scheduledAt,
+          });
+        } catch (alertError: any) {
+          // Don't fail the request if alert creation fails
+          console.error('Failed to create alert for scheduled YouTube post:', alertError.message);
+        }
+      }
 
       // Clean up uploaded files
       try {

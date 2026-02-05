@@ -11,6 +11,11 @@ export interface PublishPostJobData {
   mediaUrl?: string;
   mediaType?: string;
   type?: string;
+  // Instagram-specific fields
+  carouselItems?: Array<{url: string; type: 'photo' | 'video'}>;
+  carouselUrls?: string[];
+  locationId?: string;
+  userTags?: string;
 }
 
 export interface PublishPostJobResult {

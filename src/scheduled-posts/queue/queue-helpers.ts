@@ -236,4 +236,108 @@ export class QueueHelpers {
   async isPaused(): Promise<boolean> {
     return await this.queue.isPaused();
   }
+
+  /**
+   * Check if queue connection is healthy
+   * Tests connection by getting queue stats (lightweight operation)
+   */
+  async isConnectionHealthy(): Promise<boolean> {
+    try {
+      // Try to get queue stats - this will fail if Redis is not connected
+      const result = await Promise.race([
+        this.queue.getJobCounts(),
+        new Promise((_, reject) => {
+          setTimeout(() => reject(new Error('Connection check timeout after 3 seconds')), 3000);
+        }),
+      ]);
+      this.logger.debug(`✅ Queue connection healthy, stats: ${JSON.stringify(result)}`);
+      return true;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      const errorStack = error instanceof Error ? error.stack : undefined;
+      this.logger.warn(`⚠️ Queue connection check failed: ${errorMessage}`, errorStack);
+      return false;
+    }
+  }
+
+  /**
+   * Add job to queue with retry mechanism and connection validation
+   * 
+   * @param jobName - Job name
+   * @param jobData - Job data
+   * @param options - Job options (delay, jobId, etc.)
+   * @param maxRetries - Maximum retry attempts (default: 3)
+   * @returns Promise that resolves when job is added successfully
+   */
+  async addJobWithRetry<T = any>(
+    jobName: string,
+    jobData: T,
+    options: {
+      delay?: number;
+      jobId?: string;
+      removeOnComplete?: boolean | { age?: number; count?: number };
+      removeOnFail?: boolean | { age?: number; count?: number };
+    },
+    maxRetries = 3,
+  ): Promise<any> {
+    let lastError: Error | null = null;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        // Check connection health before attempting (skip on first attempt for speed)
+        if (attempt > 1) {
+          const isHealthy = await this.isConnectionHealthy();
+          if (!isHealthy) {
+            throw new Error('Queue connection is not healthy');
+          }
+        }
+
+        // Add job with timeout protection
+        const queuePromise = this.queue.add(jobName, jobData, options).catch((error) => {
+          // Capture the actual error from BullMQ
+          this.logger.error(`❌ Queue.add() error (attempt ${attempt}/${maxRetries}):`, {
+            message: error?.message || 'Unknown error',
+            stack: error?.stack,
+            code: (error as any)?.code,
+            errno: (error as any)?.errno,
+            syscall: (error as any)?.syscall,
+          });
+          throw error;
+        });
+        
+        const timeoutPromise = new Promise((_, reject) => {
+          setTimeout(() => {
+            reject(new Error(`Queue add operation timed out after 5 seconds (attempt ${attempt}/${maxRetries})`));
+          }, 5000);
+        });
+
+        const result = await Promise.race([queuePromise, timeoutPromise]);
+        
+        if (attempt > 1) {
+          this.logger.log(`✅ Job added successfully on attempt ${attempt}/${maxRetries}`);
+        }
+        
+        return result;
+      } catch (error: any) {
+        lastError = error;
+        const errorMessage = error.message || 'Unknown error';
+        
+        if (attempt < maxRetries) {
+          // Exponential backoff: 1s, 2s, 4s
+          const delay = Math.min(1000 * Math.pow(2, attempt - 1), 4000);
+          this.logger.warn(
+            `⚠️ Failed to add job (attempt ${attempt}/${maxRetries}): ${errorMessage}. Retrying in ${delay}ms...`,
+          );
+          await new Promise((resolve) => setTimeout(resolve, delay));
+        } else {
+          this.logger.error(
+            `❌ Failed to add job after ${maxRetries} attempts: ${errorMessage}`,
+          );
+        }
+      }
+    }
+
+    // All retries failed
+    throw lastError || new Error('Failed to add job to queue after all retries');
+  }
 }

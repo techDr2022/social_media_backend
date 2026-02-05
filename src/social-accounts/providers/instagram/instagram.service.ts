@@ -1,9 +1,14 @@
-import { Injectable, BadRequestException, InternalServerErrorException } from '@nestjs/common';
+import { Injectable, BadRequestException, InternalServerErrorException, Inject, forwardRef } from '@nestjs/common';
 import axios from 'axios';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { SocialAccountsService } from '../../social-accounts.service';
 import { InstagramPostDto } from './dto/instagram-post.dto';
 import { LogsService } from '../../../logs/logs.service';
+import { InjectQueue } from '@nestjs/bull';
+import type { Queue } from 'bull';
+import { QUEUE_NAMES, JOB_NAMES, PublishPostJobData } from '../../../scheduled-posts/queue/post-queue.types';
+import { QueueHelpers } from '../../../scheduled-posts/queue/queue-helpers';
+import { AlertsService } from '../../../alerts/alerts.service';
 
 @Injectable()
 export class InstagramService {
@@ -11,6 +16,9 @@ export class InstagramService {
     private readonly prisma: PrismaService,
     private readonly socialAccountsService: SocialAccountsService,
     private readonly logsService: LogsService,
+    @InjectQueue(QUEUE_NAMES.POST_PUBLISH) private readonly postQueue: Queue,
+    private readonly queueHelpers: QueueHelpers,
+    private readonly alertsService: AlertsService,
   ) {}
 
   async createPost(params: {
@@ -93,7 +101,7 @@ export class InstagramService {
 
     try {
       // Validate scheduled publish time if provided
-      let scheduledTimestamp: number | null = null;
+      // Always use our Redis queue system for scheduled posts (Instagram Graph API doesn't reliably support scheduling)
       if (scheduledPublishTime) {
         const scheduledDate = new Date(scheduledPublishTime);
         const now = new Date();
@@ -105,16 +113,116 @@ export class InstagramService {
         if (scheduledDate <= now) {
           throw new BadRequestException('Scheduled publish time must be in the future.');
         }
+
+        // Use our Redis queue system for ALL scheduled posts (works for any future date)
+        console.log('📅 Using queue system for scheduled post:', scheduledDate.toISOString());
+        console.log('📅 Using queue system for post scheduled beyond 25 hours');
         
-        // Instagram allows scheduling up to 25 hours in advance
-        const maxScheduledTime = new Date();
-        maxScheduledTime.setHours(maxScheduledTime.getHours() + 25);
-        if (scheduledDate > maxScheduledTime) {
-          throw new BadRequestException('Scheduled publish time cannot be more than 25 hours in the future.');
+        // Create post in database with pending status
+        const scheduledAt = new Date(scheduledPublishTime);
+        const post = await this.prisma.scheduledPost.create({
+          data: {
+            userId,
+            socialAccountId,
+            platform: 'instagram',
+            type: mediaType || 'photo',
+            content: caption || '',
+            mediaUrl: mediaType === 'carousel' ? (carouselUrls && carouselUrls.length > 0 ? carouselUrls[0] : null) : mediaUrl || null,
+            scheduledAt,
+            status: 'pending',
+          },
+        });
+
+        // Calculate delay in milliseconds
+        const delay = scheduledAt.getTime() - Date.now();
+        
+        // Prepare job data with all Instagram-specific parameters
+        const jobData: PublishPostJobData = {
+          postId: post.id,
+          userId: post.userId,
+          socialAccountId: post.socialAccountId,
+          platform: 'instagram',
+          content: caption || '',
+          mediaUrl: mediaType === 'carousel' ? undefined : mediaUrl || undefined,
+          mediaType: mediaType || undefined,
+          carouselItems: carouselItems || undefined,
+          carouselUrls: carouselUrls || undefined,
+          locationId: locationId || undefined,
+          userTags: userTags || undefined,
+        };
+
+        // Add job to BullMQ queue with delay using retry mechanism
+        try {
+          await this.queueHelpers.addJobWithRetry(
+            JOB_NAMES.PUBLISH_POST,
+            jobData,
+            {
+              delay: delay,
+              jobId: `post-${post.id}`,
+              removeOnComplete: true,
+              removeOnFail: false,
+            },
+            3, // Max 3 retries with exponential backoff
+          );
+          console.log(`✅ Job added to queue for post ${post.id}, scheduled for ${scheduledAt.toISOString()}`);
+
+          // Log success
+          this.logsService.info(
+            'instagram',
+            'Instagram post scheduled via queue system',
+            { postId: post.id, scheduledAt: scheduledAt.toISOString() },
+            userId,
+            socialAccountId,
+          );
+
+          // Create alert for scheduled post (only if queue add succeeded)
+          try {
+            const accountName = account.displayName || account.username || 'Instagram Account';
+            const postType = (mediaType || 'photo') as 'photo' | 'video' | 'carousel';
+            const message = this.alertsService.formatScheduledMessage(
+              accountName,
+              postType,
+              scheduledAt,
+            );
+
+            await this.alertsService.create({
+              userId,
+              socialAccountId,
+              scheduledPostId: post.id,
+              type: 'scheduled',
+              platform: 'instagram',
+              title: 'Scheduled Successfully',
+              message,
+              accountName,
+              postType,
+              scheduledAt,
+            });
+          } catch (alertError: any) {
+            // Don't fail the request if alert creation fails
+            console.error('Failed to create alert for scheduled post:', alertError.message);
+          }
+        } catch (queueError: any) {
+          console.error(`❌ Failed to add job to queue after retries: ${queueError.message}`);
+          // If Redis is unavailable or times out after retries, we still save the post to database
+          // The post will remain in 'pending' status and can be manually processed or retried later
+          // Don't throw error - post is saved, just queue failed
+          this.logsService.error(
+            'instagram',
+            'Failed to add scheduled post to queue after retries (Redis unavailable or timeout)',
+            queueError,
+            { postId: post.id, scheduledAt: scheduledAt.toISOString() },
+            userId,
+            socialAccountId,
+          );
+          // Continue - post is saved, user can retry later or we can add a cron to process pending posts
         }
-        
-        scheduledTimestamp = Math.floor(scheduledDate.getTime() / 1000);
-        console.log('📅 Scheduled publish time:', scheduledDate.toISOString(), 'Unix:', scheduledTimestamp);
+
+        // Return success response
+        return {
+          success: true,
+          postId: post.id,
+          message: 'Post scheduled successfully (will be published via queue system)',
+        };
       }
 
       // Validate media URL if provided (but not for carousel posts)
@@ -122,7 +230,7 @@ export class InstagramService {
         throw new BadRequestException('Media URL is required for photo/video posts');
       }
 
-      // Create media container
+      // Create media container (for immediate posts only - scheduled posts use queue system above)
       if (mediaType === 'photo' && mediaUrl) {
         // Photo post
         const containerData: any = {
@@ -148,10 +256,7 @@ export class InstagramService {
           }
         }
 
-        // Schedule if provided
-        if (scheduledTimestamp) {
-          containerData.scheduled_publish_time = scheduledTimestamp.toString();
-        }
+        // No scheduling here - scheduled posts use queue system above
 
         console.log('📤 Creating Instagram photo container...');
         console.log('🔄 Using Instagram Graph API (graph.instagram.com) for Instagram Login...');
@@ -160,7 +265,7 @@ export class InstagramService {
           caption: caption?.substring(0, 50) || '',
           has_location: !!locationId,
           has_user_tags: !!userTags,
-          scheduled: !!scheduledTimestamp,
+          scheduled: false, // Scheduled posts use queue system
           user_id: igUserId,
         });
         console.log('🔑 Token preview:', accessToken.substring(0, 20) + '...');
@@ -270,10 +375,7 @@ export class InstagramService {
           }
         }
 
-        // Schedule if provided
-        if (scheduledTimestamp) {
-          containerData.scheduled_publish_time = scheduledTimestamp.toString();
-        }
+        // No scheduling here - scheduled posts use queue system above
 
         console.log('🎥 Creating Instagram video container...');
         console.log('🔄 Using Instagram Graph API (graph.instagram.com) for Instagram Login...');
@@ -283,7 +385,7 @@ export class InstagramService {
           caption: caption?.substring(0, 50) || '',
           has_location: !!locationId,
           has_user_tags: !!userTags,
-          scheduled: !!scheduledTimestamp,
+          scheduled: false, // Scheduled posts use queue system
           user_id: igUserId,
         });
         console.log('🔑 Token preview:', accessToken.substring(0, 20) + '...');
@@ -383,7 +485,7 @@ export class InstagramService {
           caption: caption?.substring(0, 50) || '',
           has_location: !!locationId,
           has_user_tags: !!userTags,
-          scheduled: !!scheduledTimestamp,
+          scheduled: false, // Scheduled posts use queue system
           user_id: igUserId,
           itemTypes: items.map(item => item.type),
         });
@@ -553,10 +655,7 @@ export class InstagramService {
           caption: caption || '',
         };
 
-        // Schedule if provided
-        if (scheduledTimestamp) {
-          carouselContainerData.scheduled_publish_time = scheduledTimestamp.toString();
-        }
+        // No scheduling here - scheduled posts use queue system above
 
         console.log('📤 Creating carousel container...');
         
@@ -640,18 +739,17 @@ export class InstagramService {
       }
 
       // Publish the media container
-      if (!scheduledTimestamp) {
-        // Immediate publish
-        console.log('📤 Publishing Instagram post...');
-        console.log('🔄 Using Instagram Graph API (graph.instagram.com) for Instagram Login...');
-        
-        // Instagram API with Instagram Login uses graph.instagram.com
-        // For Instagram Login, we should wait a moment for the container to be ready
-        // But for photos, it's usually instant. Let's add a small delay just in case.
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        
-        // Verify container exists and is accessible before publishing
-        try {
+      // Immediate publish (scheduled posts handled by queue system above)
+      console.log('📤 Publishing Instagram post...');
+      console.log('🔄 Using Instagram Graph API (graph.instagram.com) for Instagram Login...');
+      
+      // Instagram API with Instagram Login uses graph.instagram.com
+      // For Instagram Login, we should wait a moment for the container to be ready
+      // But for photos, it's usually instant. Let's add a small delay just in case.
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      
+      // Verify container exists and is accessible before publishing
+      try {
           console.log('🔍 Verifying container exists before publishing...');
           const containerCheck = await axios.get(
             `https://graph.instagram.com/v21.0/${mediaContainerId}`,
@@ -662,27 +760,65 @@ export class InstagramService {
               },
             },
           );
-          console.log('✅ Container verified:', {
-            id: containerCheck.data.id,
-            status_code: containerCheck.data.status_code,
-          });
-        } catch (checkError: any) {
-          console.warn('⚠️ Could not verify container (might be okay):', checkError.response?.data?.error?.message || checkError.message);
-          // Continue anyway - container might still be valid
-        }
+        console.log('✅ Container verified:', {
+          id: containerCheck.data.id,
+          status_code: containerCheck.data.status_code,
+        });
+      } catch (checkError: any) {
+        console.warn('⚠️ Could not verify container (might be okay):', checkError.response?.data?.error?.message || checkError.message);
+        // Continue anyway - container might still be valid
+      }
+      
+      // Try /me/media_publish first (represents the user from the token)
+      // For Instagram Login, /<IG_ID>/media_publish might not work, so we'll only try /me
+      let publishRes;
+      try {
+        console.log('🔄 Trying /me/media_publish endpoint (Instagram Login format)...');
+        console.log('📋 Publish data:', {
+          creation_id: mediaContainerId,
+          container_created: 'just now',
+        });
         
-        // Try /me/media_publish first (represents the user from the token)
-        // For Instagram Login, /<IG_ID>/media_publish might not work, so we'll only try /me
-        let publishRes;
-        try {
-          console.log('🔄 Trying /me/media_publish endpoint (Instagram Login format)...');
-          console.log('📋 Publish data:', {
+        publishRes = await axios.post(
+          `https://graph.instagram.com/v21.0/me/media_publish`,
+          {
             creation_id: mediaContainerId,
-            container_created: 'just now',
-          });
-          
+          },
+          {
+            params: {
+              access_token: accessToken, // Send as query parameter
+            },
+            headers: {
+              'Content-Type': 'application/json',
+            },
+          },
+        );
+        console.log('✅ Successfully used /me/media_publish endpoint');
+        console.log('📋 Publish response:', {
+          status: publishRes.status,
+          statusText: publishRes.statusText,
+          hasData: !!publishRes.data,
+          dataKeys: publishRes.data ? Object.keys(publishRes.data) : [],
+          fullData: JSON.stringify(publishRes.data, null, 2),
+        });
+      } catch (meError: any) {
+        // Log the /me error details
+        console.error('❌ /me/media_publish failed:', {
+          status: meError.response?.status,
+          statusText: meError.response?.statusText,
+          error: meError.response?.data,
+          message: meError.message,
+          container_id: mediaContainerId,
+          token_type: accessToken.startsWith('IGAA') ? 'Instagram Login Token (IGAA)' : 'Unknown',
+          token_preview: accessToken.substring(0, 30) + '...',
+        });
+        
+        // For Instagram Login, /<IG_ID>/media_publish typically doesn't work
+        // But let's try it as a fallback and log the error
+        console.log('⚠️ /me/media_publish failed, trying /<IG_ID>/media_publish endpoint as fallback...');
+        try {
           publishRes = await axios.post(
-            `https://graph.instagram.com/v21.0/me/media_publish`,
+            `https://graph.instagram.com/v21.0/${igUserId}/media_publish`,
             {
               creation_id: mediaContainerId,
             },
@@ -695,124 +831,73 @@ export class InstagramService {
               },
             },
           );
-          console.log('✅ Successfully used /me/media_publish endpoint');
-          console.log('📋 Publish response:', {
-            status: publishRes.status,
-            statusText: publishRes.statusText,
-            hasData: !!publishRes.data,
-            dataKeys: publishRes.data ? Object.keys(publishRes.data) : [],
-            fullData: JSON.stringify(publishRes.data, null, 2),
-          });
-        } catch (meError: any) {
-          // Log the /me error details
-          console.error('❌ /me/media_publish failed:', {
-            status: meError.response?.status,
-            statusText: meError.response?.statusText,
-            error: meError.response?.data,
-            message: meError.message,
-            container_id: mediaContainerId,
-            token_type: accessToken.startsWith('IGAA') ? 'Instagram Login Token (IGAA)' : 'Unknown',
-            token_preview: accessToken.substring(0, 30) + '...',
+          console.log('✅ Successfully used /<IG_ID>/media_publish endpoint');
+        } catch (igError: any) {
+          // Both failed - log both errors and throw
+          console.error('❌ /<IG_ID>/media_publish also failed:', {
+            status: igError.response?.status,
+            statusText: igError.response?.statusText,
+            error: igError.response?.data,
+            message: igError.message,
           });
           
-          // For Instagram Login, /<IG_ID>/media_publish typically doesn't work
-          // But let's try it as a fallback and log the error
-          console.log('⚠️ /me/media_publish failed, trying /<IG_ID>/media_publish endpoint as fallback...');
-          try {
-            publishRes = await axios.post(
-              `https://graph.instagram.com/v21.0/${igUserId}/media_publish`,
-              {
-                creation_id: mediaContainerId,
-              },
-              {
-                params: {
-                  access_token: accessToken, // Send as query parameter
-                },
-                headers: {
-                  'Content-Type': 'application/json',
-                },
-              },
-            );
-            console.log('✅ Successfully used /<IG_ID>/media_publish endpoint');
-          } catch (igError: any) {
-            // Both failed - log both errors and throw
-            console.error('❌ /<IG_ID>/media_publish also failed:', {
-              status: igError.response?.status,
-              statusText: igError.response?.statusText,
-              error: igError.response?.data,
-              message: igError.message,
-            });
-            
-            // Use the /me error message (more relevant for Instagram Login)
-            const errorMsg = meError.response?.data?.error?.message || igError.response?.data?.error?.message || meError.message;
-            const errorCode = meError.response?.data?.error?.code || igError.response?.data?.error?.code;
-            const errorType = meError.response?.data?.error?.type || igError.response?.data?.error?.type;
-            const errorSubcode = meError.response?.data?.error?.error_subcode || igError.response?.data?.error?.error_subcode;
-            
-            // Provide more helpful error message
-            let helpfulMsg = `Failed to publish Instagram post: ${errorMsg}`;
-            if (errorCode === 100 && errorSubcode === 33) {
-              helpfulMsg += '\n\nThis error usually means:\n';
-              helpfulMsg += '1. The container might not be ready yet (try waiting a few seconds)\n';
-              helpfulMsg += '2. The access token might not have the required permissions (instagram_business_content_publish)\n';
-              helpfulMsg += '3. The Instagram account might not be a Business or Creator account\n';
-              helpfulMsg += `4. Container ID: ${mediaContainerId}`;
-            }
-            
-            throw new InternalServerErrorException(
-              helpfulMsg + `\nError Code: ${errorCode || 'N/A'}, Subcode: ${errorSubcode || 'N/A'}, Type: ${errorType || 'N/A'}. ` +
-              `Status: ${meError.response?.status || 'N/A'}. ` +
-              `Tried both /me/media_publish and /<IG_ID>/media_publish endpoints.`
-            );
+          // Use the /me error message (more relevant for Instagram Login)
+          const errorMsg = meError.response?.data?.error?.message || igError.response?.data?.error?.message || meError.message;
+          const errorCode = meError.response?.data?.error?.code || igError.response?.data?.error?.code;
+          const errorType = meError.response?.data?.error?.type || igError.response?.data?.error?.type;
+          const errorSubcode = meError.response?.data?.error?.error_subcode || igError.response?.data?.error?.error_subcode;
+          
+          // Provide more helpful error message
+          let helpfulMsg = `Failed to publish Instagram post: ${errorMsg}`;
+          if (errorCode === 100 && errorSubcode === 33) {
+            helpfulMsg += '\n\nThis error usually means:\n';
+            helpfulMsg += '1. The container might not be ready yet (try waiting a few seconds)\n';
+            helpfulMsg += '2. The access token might not have the required permissions (instagram_business_content_publish)\n';
+            helpfulMsg += '3. The Instagram account might not be a Business or Creator account\n';
+            helpfulMsg += `4. Container ID: ${mediaContainerId}`;
           }
-        }
-
-        // Check if publishRes has the expected data
-        if (!publishRes || !publishRes.data || !publishRes.data.id) {
-          console.error('❌ Publish response missing post ID:', {
-            hasResponse: !!publishRes,
-            hasData: !!publishRes?.data,
-            responseData: publishRes?.data,
-          });
+          
           throw new InternalServerErrorException(
-            `Failed to publish Instagram post: Instagram API returned invalid response. Container ID: ${mediaContainerId}`
+            helpfulMsg + `\nError Code: ${errorCode || 'N/A'}, Subcode: ${errorSubcode || 'N/A'}, Type: ${errorType || 'N/A'}. ` +
+            `Status: ${meError.response?.status || 'N/A'}. ` +
+            `Tried both /me/media_publish and /<IG_ID>/media_publish endpoints.`
           );
         }
+      }
 
-        postId = publishRes.data.id;
-        console.log(`✅ Instagram post published: ${postId}`);
-        console.log(`📋 Full publish response:`, JSON.stringify(publishRes.data, null, 2));
-        
-        // Log successful publish (wrap in try-catch to prevent logging errors from breaking the flow)
-        try {
-          this.logsService.info(
-            'instagram',
-            'Instagram post published successfully',
-            { postId, containerId: mediaContainerId, mediaType },
-            userId,
-            socialAccountId,
-          );
-        } catch (logError: any) {
-          console.warn('⚠️ Failed to log success (non-critical):', logError.message);
-        }
-      } else {
-        // Scheduled post - Instagram will publish automatically at the scheduled time
-        postId = mediaContainerId; // Use container ID as post ID for scheduled posts
-        console.log(`📅 Instagram post scheduled: ${postId}`);
-        
-        // Log scheduled post
-        this.logsService.info(
-          'instagram',
-          'Instagram post scheduled successfully',
-          { postId, containerId: mediaContainerId, mediaType, scheduledTime: scheduledPublishTime },
-          userId,
-          socialAccountId,
+      // Check if publishRes has the expected data
+      if (!publishRes || !publishRes.data || !publishRes.data.id) {
+        console.error('❌ Publish response missing post ID:', {
+          hasResponse: !!publishRes,
+          hasData: !!publishRes?.data,
+          responseData: publishRes?.data,
+        });
+        throw new InternalServerErrorException(
+          `Failed to publish Instagram post: Instagram API returned invalid response. Container ID: ${mediaContainerId}`
         );
       }
 
+      postId = publishRes.data.id;
+      console.log(`✅ Instagram post published: ${postId}`);
+      console.log(`📋 Full publish response:`, JSON.stringify(publishRes.data, null, 2));
+      
+      // Log successful publish (wrap in try-catch to prevent logging errors from breaking the flow)
+      try {
+        this.logsService.info(
+          'instagram',
+          'Instagram post published successfully',
+          { postId, containerId: mediaContainerId, mediaType },
+          userId,
+          socialAccountId,
+        );
+      } catch (logError: any) {
+        console.warn('⚠️ Failed to log success (non-critical):', logError.message);
+      }
+
+      // Scheduled posts are handled by queue system above, so we only reach here for immediate posts
       // Try to fetch post URL (permalink) for immediate posts
       // postUrl already declared at top of function
-      if (!scheduledTimestamp && postId) {
+      if (postId) {
         try {
           // Wait a few seconds for Instagram to process the post
           await new Promise(resolve => setTimeout(resolve, 2000));
@@ -835,10 +920,8 @@ export class InstagramService {
           console.warn('⚠️ Could not fetch permalink, using constructed URL:', permalinkError.message);
           postUrl = `https://www.instagram.com/p/${postId}/`;
         }
-      } else if (scheduledTimestamp) {
-        // For scheduled posts, we can't get the URL until it's published
-        postUrl = null;
       }
+      // Scheduled posts handled by queue system above, so no URL yet
 
       // Save to database (fire-and-forget to prevent blocking response)
       // This runs asynchronously so it doesn't delay the response
@@ -1054,7 +1137,7 @@ export class InstagramService {
           userMessage = `🔑 Instagram Token Expired\n\nYour Instagram access token has expired. You need to reconnect your Instagram account.\n\n⏰ **Token Expiration Times:**\n- Short-lived tokens: ~1 hour\n- Long-lived tokens: 60 days (if exchange works)\n- Tokens can be refreshed before expiration\n\n✅ **Solution:**\n1. Go to your Instagram accounts page\n2. Delete the expired Instagram account\n3. Click "Connect Instagram" to reconnect\n4. This will get a fresh token (we'll try to exchange it for a 60-day token)\n\nToken expired: ${igError.message || 'Access token is no longer valid'}\n\n💡 **Tip:** After reconnecting, the token should last 60 days. If it expires again quickly, there might be an issue with token exchange.`;
         } else if (igError.code === 100 || igError.error_subcode === 33) {
           const appId = process.env.INSTAGRAM_APP_ID || process.env.FACEBOOK_APP_ID || 'YOUR_APP_ID';
-          userMessage = `🚫 Instagram Posting Blocked - App Review Required\n\nYour app is in Development mode and Instagram blocks posting to real accounts.\n\n📋 QUICK FIX OPTIONS:\n\n1️⃣ **Use Test Users (Fastest for Development)**\n   Step 1: Go to https://developers.facebook.com/apps/${appId}/roles/test-users\n   Step 2: Create a Test User\n   Step 3: Connect Test User's Instagram Business Account\n   ✅ Posting will work with Test Users!\n\n2️⃣ **Submit for App Review (For Production)**\n   Step 1: Go to https://developers.facebook.com/apps/${appId}/app-review\n   Step 2: Request "instagram_content_publish" permission\n   Step 3: Fill out the form and submit\n   Step 4: Wait for approval (1-7 days)\n   ✅ Posting will work for all users!\n\n3️⃣ **Verify Instagram Business Account**\n   - Make sure your Instagram account is a Business Account\n   - Connect it to a Facebook Page\n   - Grant all required permissions\n\nError: ${igError.message}`;
+          userMessage = `🚫 Instagram Posting Blocked - App Review Required\n\nYour app is in Development mode and Instagram blocks posting to real accounts.\n\n📋 QUICK FIX OPTIONS:\n\n1️⃣ **Use Test Users (Fastest for Development)**\n   Step 1: Go to https://developers.facebook.com/apps/${appId}/roles/test-users\n   Step 2: Create a Test User\n   Step 3: Connect Test User's Instagram Business Account\n   ✅ Posting will work with Test Users!\n\n2️⃣ **Submit for App Review (For Production)**\n   Step 1: Go to https://developers.facebook.com/apps/${appId}/app-review\n   Step 2: Request "instagram_business_content_publish" permission (Instagram Login) or "instagram_content_publish" (if using Facebook Login)\n   Step 3: Fill out the form and submit\n   Step 4: Wait for approval (1-7 days)\n   ✅ Posting will work for all users!\n\n3️⃣ **Verify Instagram Business Account**\n   - Make sure your Instagram account is a Business Account\n   - Connect it to a Facebook Page\n   - Grant all required permissions\n\nError: ${igError.message}`;
         } else if (igError.message?.toLowerCase().includes('media') || igError.message?.toLowerCase().includes('url')) {
           userMessage = `📷 Media Upload Error\n\nInstagram cannot access the media from the provided URL.\n\nPossible causes:\n1. **Storage Bucket is Private** - Make the bucket public\n2. **URL is Invalid** - Check that the URL is accessible\n3. **Format Not Supported** - Instagram supports:\n   - Photos: JPG, PNG (max 8MB)\n   - Videos: MP4, MOV (max 100MB for posts, 1GB for Reels)\n4. **File Too Large** - Check Instagram size limits\n\nError: ${igError.message}`;
         }

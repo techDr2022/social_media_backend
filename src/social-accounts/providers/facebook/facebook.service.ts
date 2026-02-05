@@ -5,12 +5,16 @@ import FormData from 'form-data';
 import { PrismaService } from '../../../prisma/prisma.service';
 import { SocialAccountsService } from '../../social-accounts.service';
 import { FacebookPostDto } from './dto/facebook-post.dto';
+import { AlertsService } from '../../../alerts/alerts.service';
+import { EncryptionService } from '../../../common/encryption.service';
 
 @Injectable()
 export class FacebookService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly socialAccountsService: SocialAccountsService,
+    private readonly alertsService: AlertsService,
+    private readonly encryption: EncryptionService,
   ) {}
 
   async createPost(params: {
@@ -102,11 +106,11 @@ export class FacebookService {
         if (targetPage) {
           console.log(`✅ Got fresh page token for page ${pageId} (${targetPage.name})`);
           accessToken = targetPage.access_token;
-          
-          // Update stored token
+
+          // Update stored token (encrypt before storing)
           await this.prisma.socialAccount.update({
             where: { id: account.id },
-            data: { accessToken },
+            data: { accessToken: this.encryption.encrypt(accessToken) },
           });
         }
       }
@@ -538,7 +542,7 @@ export class FacebookService {
       // Save to database
       const scheduledAt = scheduledPublishTime ? new Date(scheduledPublishTime) : new Date();
 
-      await this.prisma.scheduledPost.create({
+      const scheduledPost = await this.prisma.scheduledPost.create({
         data: {
           userId,
           socialAccountId,
@@ -554,6 +558,39 @@ export class FacebookService {
           errorMessage: null, // No error for successful posts
         },
       });
+
+      // Create alert for scheduled post (Facebook uses native scheduling)
+      if (scheduledPublishTime) {
+        try {
+          const accountName = account.displayName || account.username || 'Facebook Page';
+          const postType = (isCarousel ? 'carousel' : (mediaType || 'photo')) as 'photo' | 'video' | 'carousel';
+          const formattedDate = scheduledAt.toLocaleString('en-US', {
+            month: 'short',
+            day: 'numeric',
+            year: 'numeric',
+            hour: 'numeric',
+            minute: '2-digit',
+            hour12: true,
+          });
+          const message = `Your ${postType} post for ${accountName} is scheduled for ${formattedDate}. Post scheduled through the app.`;
+
+          await this.alertsService.create({
+            userId,
+            socialAccountId,
+            scheduledPostId: scheduledPost.id,
+            type: 'scheduled',
+            platform: 'facebook',
+            title: 'Scheduled Successfully',
+            message,
+            accountName,
+            postType,
+            scheduledAt,
+          });
+        } catch (alertError: any) {
+          // Don't fail the request if alert creation fails
+          console.error('Failed to create alert for scheduled Facebook post:', alertError.message);
+        }
+      }
 
       return {
         success: true,

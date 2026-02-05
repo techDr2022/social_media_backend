@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Module, forwardRef } from '@nestjs/common';
 import { BullModule } from '@nestjs/bull';
 import { getBullMQRedisConfig } from '../../config/redis.config';
 import { QUEUE_NAMES } from './post-queue.types';
@@ -11,6 +11,7 @@ import { InstagramModule } from '../../social-accounts/providers/instagram/insta
 import { FacebookModule } from '../../social-accounts/providers/facebook/facebook.module';
 import { YoutubeModule } from '../../social-accounts/providers/youtube/youtube.module';
 import { RedisConnectionService } from '../../config/redis-connection.service';
+import { AlertsModule } from '../../alerts/alerts.module';
 
 /**
  * Post Queue Module
@@ -56,9 +57,10 @@ import { RedisConnectionService } from '../../config/redis-connection.service';
       },
     }),
     PrismaModule, // For PrismaService
-    InstagramModule, // For InstagramService
+    forwardRef(() => InstagramModule), // For InstagramService (use forwardRef to break circular dependency)
     FacebookModule, // For FacebookService
     YoutubeModule, // For YoutubeService
+    AlertsModule, // For creating alerts
   ],
   providers: [
     PostProcessor,

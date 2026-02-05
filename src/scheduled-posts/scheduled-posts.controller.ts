@@ -105,5 +105,12 @@ import {
       const user = (req as any).user;
       return this.service.remove(user.id, id);
     }
+
+    @UseGuards(SupabaseAuthGuard)
+    @Get('media/all')
+    async getAllMedia(@Req() req: Request) {
+      const user = (req as any).user;
+      return this.service.findAllMediaForUser(user.id);
+    }
   }
   

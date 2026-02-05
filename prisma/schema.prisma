@@ -15,6 +15,7 @@ model User {
   scheduledPosts ScheduledPost[]
   socialAccounts SocialAccount[]
   subscriptions  Subscription[]
+  alerts         Alert[]
 }
 
 model SocialAccount {
@@ -121,4 +122,27 @@ model Log {
   @@index([method])
   @@index([path])
   @@index([statuscode])
+}
+
+model Alert {
+  id              String        @id @default(uuid())
+  userId          String
+  socialAccountId String?
+  scheduledPostId String?       // Link to the scheduled post
+  type            String        // 'scheduled', 'processing', 'success', 'failed'
+  platform        String        // 'instagram', 'facebook', 'youtube'
+  title           String        // Alert title (e.g., "Post Scheduled")
+  message         String        // Alert message (e.g., "Your photo post for @accountname is scheduled for Feb 5, 2026 at 3:00 PM")
+  accountName     String?       // Display name of the social account
+  postType        String?       // 'photo', 'video', 'carousel'
+  scheduledAt     DateTime?     // When the post is scheduled for
+  isRead          Boolean       @default(false)
+  createdAt       DateTime      @default(now())
+  user            User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // ⭐ Optimized indexes for common queries
+  @@index([userId, isRead, createdAt]) // For user's unread alerts, newest first
+  @@index([userId, createdAt]) // For user's all alerts, newest first
+  @@index([isRead]) // For bulk read operations
+  @@index([type]) // For filtering by type
 }

@@ -2,10 +2,28 @@
 import { Injectable, BadRequestException, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { TokenRefreshService } from '../utils/token-refresh.service';
+import { TokenExpirationService } from './token-expiration.service';
+import { EncryptionService } from '../common/encryption.service';
+import { AppException } from '../common/errors/custom-exception';
+import { ErrorCode } from '../common/errors/error-codes';
 import axios from 'axios';
 import * as fs from 'fs';
 import FormData from 'form-data';
 import { refreshGoogleToken } from '../utils/google-refresh';
+
+export type TokenStatus = 'healthy' | 'expiring_soon' | 'expired' | 'disconnected';
+
+export interface TokenStatusItem {
+  id: string;
+  platform: string;
+  displayName: string | null;
+  username: string | null;
+  tokenExpiresAt: Date | null;
+  expiresInHuman: string;
+  status: TokenStatus;
+  canRefresh: boolean;
+  reconnectPath: string;
+}
 
 @Injectable()
 export class SocialAccountsService {
@@ -14,6 +32,8 @@ export class SocialAccountsService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly tokenRefresh: TokenRefreshService,
+    private readonly tokenExpiration: TokenExpirationService,
+    private readonly encryption: EncryptionService,
   ) {}
 
   // ---- OAUTH ----
@@ -27,34 +47,37 @@ async getValidYoutubeAccessToken(socialAccountId: string) {
     throw new Error('Invalid YouTube account');
   }
 
-  if (!account.refreshToken) {
+  const refreshToken = this.encryption.decrypt(account.refreshToken);
+  const accessTokenRaw = this.encryption.decrypt(account.accessToken);
+
+  if (!refreshToken) {
     throw new Error('Missing refresh token');
   }
 
   // Use TokenRefreshService for automatic refresh with retry logic
   const accessToken = await this.tokenRefresh.getValidToken(
     account.platform,
-    account.refreshToken,
-    account.accessToken,
+    refreshToken,
+    accessTokenRaw,
     account.tokenExpiresAt,
   );
 
   // Update token if it was refreshed
   const bufferTime = 5 * 60 * 1000; // 5 minutes
-  const isExpired = !account.tokenExpiresAt || 
+  const isExpired = !account.tokenExpiresAt ||
     account.tokenExpiresAt.getTime() <= Date.now() + bufferTime;
 
-  if (isExpired || accessToken !== account.accessToken) {
-    const refreshed = await this.tokenRefresh.refreshGoogleToken(account.refreshToken);
-    
+  if (isExpired || accessToken !== accessTokenRaw) {
+    const refreshed = await this.tokenRefresh.refreshGoogleToken(refreshToken);
+
     await this.prisma.socialAccount.update({
       where: { id: account.id },
       data: {
-        accessToken: refreshed.accessToken,
+        accessToken: this.encryption.encrypt(refreshed.accessToken),
         tokenExpiresAt: refreshed.expiresAt,
       },
     });
-    
+
     this.logger.log(`✅ Refreshed YouTube token for account ${account.id}`);
     return refreshed.accessToken;
   }
@@ -121,8 +144,8 @@ async getValidYoutubeAccessToken(socialAccountId: string) {
         platform: 'youtube',
         externalId: channel.id,
         displayName: channel.snippet.title,
-        accessToken: access_token,
-        refreshToken: refresh_token,
+        accessToken: this.encryption.encrypt(access_token),
+        refreshToken: this.encryption.encrypt(refresh_token),
         tokenExpiresAt: new Date(Date.now() + expires_in * 1000),
       },
     });
@@ -191,12 +214,13 @@ const res = await axios.post(
       throw new Error('Invalid Facebook account');
     }
 
-    if (!account.accessToken) {
+    const accessToken = this.encryption.decrypt(account.accessToken);
+    if (!accessToken) {
       throw new Error('Missing access token');
     }
 
     // Facebook page tokens are long-lived (60 days)
-    return account.accessToken;
+    return accessToken;
   }
 
   // Facebook Pages (exclusively) - uses FACEBOOK_APP_ID and FACEBOOK_APP_SECRET
@@ -270,7 +294,7 @@ const res = await axios.post(
           platform: 'facebook',
           externalId: page.id,
           displayName: page.name,
-          accessToken: page.access_token,
+          accessToken: this.encryption.encrypt(page.access_token),
           tokenExpiresAt: expires_in ? new Date(Date.now() + expires_in * 1000) : null,
           accountType: 'page',
         },
@@ -292,6 +316,7 @@ const res = await axios.post(
       throw new Error('Invalid Instagram account');
     }
 
+    account.accessToken = this.encryption.decrypt(account.accessToken);
     if (!account.accessToken) {
       throw new Error('Missing access token');
     }
@@ -299,13 +324,13 @@ const res = await axios.post(
     // Check if token is expired or will expire soon (within 1 hour)
     const now = new Date();
     const oneHourFromNow = new Date(now.getTime() + 60 * 60 * 1000); // 1 hour buffer
-    
+
     // If no expiration date, this is likely an old account created before we added expiration tracking
     // Try to validate the token by making a test API call, and if it works, estimate expiration
     if (!account.tokenExpiresAt) {
       console.warn(`[Instagram Token] ⚠️ No expiration date set in database. This might be an old account.`);
       console.warn(`[Instagram Token] Attempting to validate token and set expiration date...`);
-      
+
       try {
         // Try to validate token by fetching user info
         const validationRes = await axios.get(
@@ -376,15 +401,15 @@ const res = await axios.post(
             account.scopes // Pass permissions for validation
           );
           
-          // Update account with new token
+          // Update account with new token (encrypt before storing)
           await this.prisma.socialAccount.update({
             where: { id: account.id },
             data: {
-              accessToken: refreshedToken.accessToken,
+              accessToken: this.encryption.encrypt(refreshedToken.accessToken),
               tokenExpiresAt: refreshedToken.expiresAt,
             },
           });
-          
+
           console.log(`[Instagram Token] ✅ Token refreshed successfully. New expiration: ${refreshedToken.expiresAt.toISOString()}`);
           return refreshedToken.accessToken;
         } catch (refreshError: any) {
@@ -639,6 +664,7 @@ const res = await axios.post(
             },
           });
 
+          const encryptedPageToken = this.encryption.encrypt(page.access_token);
           let savedAccount;
           if (existingIgAccount) {
             // Update existing Instagram account
@@ -647,7 +673,7 @@ const res = await axios.post(
               data: {
                 displayName: igAccount.username || `Instagram ${igAccount.id}`,
                 username: igAccount.username,
-                accessToken: page.access_token,
+                accessToken: encryptedPageToken,
                 tokenExpiresAt: expires_in ? new Date(Date.now() + expires_in * 1000) : null,
                 isActive: true,
               },
@@ -662,7 +688,7 @@ const res = await axios.post(
                 externalId: igAccount.id,
                 displayName: igAccount.username || `Instagram ${igAccount.id}`,
                 username: igAccount.username,
-                accessToken: page.access_token,
+                accessToken: encryptedPageToken,
                 tokenExpiresAt: expires_in ? new Date(Date.now() + expires_in * 1000) : null,
                 accountType: 'business',
               },
@@ -1018,12 +1044,12 @@ const res = await axios.post(
       account = await this.prisma.socialAccount.update({
         where: { id: existingAccount.id },
         data: {
-          displayName: igUsername, // Use username as display name
+          displayName: igUsername,
           username: igUsername,
-          accessToken: igAccessToken,
-          refreshToken: refreshToken,
+          accessToken: this.encryption.encrypt(igAccessToken),
+          refreshToken: refreshToken ? this.encryption.encrypt(refreshToken) : null,
           tokenExpiresAt: tokenExpiresAt,
-          scopes: permissionsStr, // Store permissions for validation
+          scopes: permissionsStr,
           isActive: true,
         },
       });
@@ -1035,19 +1061,195 @@ const res = await axios.post(
           userId,
           platform: 'instagram',
           externalId: igAccountId,
-          displayName: igUsername, // Use username as display name
+          displayName: igUsername,
           username: igUsername,
-          accessToken: igAccessToken,
-          refreshToken: refreshToken,
+          accessToken: this.encryption.encrypt(igAccessToken),
+          refreshToken: refreshToken ? this.encryption.encrypt(refreshToken) : null,
           tokenExpiresAt: tokenExpiresAt,
-          scopes: permissionsStr, // Store permissions for validation
-          accountType: 'business', // Business or Creator account (both work)
+          scopes: permissionsStr,
+          accountType: 'business',
         },
       });
     }
 
     console.log(`[Instagram OAuth] ✅ Instagram account saved: platform=${account.platform}, externalId=${account.externalId}, displayName=${account.displayName}`);
     return [account];
+  }
+
+  // ---- TOKEN STATUS (for "Your keys" page) ----
+
+  private getReconnectPath(platform: string): string {
+    const m: Record<string, string> = {
+      youtube: '/connect/youtube',
+      facebook: '/connect/facebook',
+      instagram: '/connect/instagram',
+    };
+    return m[platform?.toLowerCase()] ?? '/connect';
+  }
+
+  async getTokenStatusForUser(userId: string): Promise<TokenStatusItem[]> {
+    const accounts = await this.prisma.socialAccount.findMany({
+      where: { userId },
+      select: {
+        id: true,
+        platform: true,
+        displayName: true,
+        username: true,
+        tokenExpiresAt: true,
+        isActive: true,
+        refreshToken: true, // used only to set canRefresh, not returned
+      },
+    });
+
+    const now = Date.now();
+    const in24h = now + 24 * 60 * 60 * 1000;
+
+    return accounts.map((acc) => {
+      const hasRefresh = acc.refreshToken != null && String(acc.refreshToken).trim() !== '';
+      const plat = acc.platform?.toLowerCase();
+      // YouTube/Google need refresh token; Facebook & Instagram show Refresh when active (backend will try token refresh)
+      const canRefresh =
+        (['youtube', 'google'].includes(plat) && hasRefresh) ||
+        (['facebook', 'instagram'].includes(plat) && acc.isActive);
+
+      let status: TokenStatus = 'healthy';
+      if (!acc.isActive) {
+        status = 'disconnected';
+      } else if (!acc.tokenExpiresAt) {
+        status = canRefresh ? 'healthy' : 'expired';
+      } else {
+        const exp = acc.tokenExpiresAt.getTime();
+        if (exp <= now) status = 'expired';
+        else if (exp <= in24h) status = 'expiring_soon';
+      }
+
+      const expiresInHuman = this.tokenExpiration.getTimeUntilExpirationHuman(acc.tokenExpiresAt);
+
+      return {
+        id: acc.id,
+        platform: acc.platform,
+        displayName: acc.displayName,
+        username: acc.username,
+        tokenExpiresAt: acc.tokenExpiresAt,
+        expiresInHuman,
+        status,
+        canRefresh,
+        reconnectPath: this.getReconnectPath(acc.platform),
+      };
+    });
+  }
+
+  async refreshAccountToken(accountId: string, userId: string): Promise<{ tokenExpiresAt: Date }> {
+    const id = typeof accountId === 'string' ? accountId.trim() : '';
+    if (!id) {
+      throw new AppException(ErrorCode.ACCOUNT_NOT_FOUND, 'Account ID is required.', 400);
+    }
+    const account = await this.prisma.socialAccount.findFirst({
+      where: { id },
+    });
+    if (!account) {
+      this.logger.warn(`Refresh failed: account not found`, { accountId: id, userId });
+      throw new AppException(
+        ErrorCode.ACCOUNT_NOT_FOUND,
+        'Account not found. Try reconnecting from Accounts, or use Reconnect below.',
+        404,
+      );
+    }
+    if (account.userId !== userId) {
+      throw new AppException(
+        ErrorCode.ACCOUNT_NOT_OWNED_BY_USER,
+        'You do not have access to this account.',
+        403,
+      );
+    }
+
+    const platform = account.platform?.toLowerCase();
+    const refreshToken = this.encryption.decrypt(account.refreshToken);
+    const accessToken = this.encryption.decrypt(account.accessToken);
+
+    if (!refreshToken && platform !== 'instagram') {
+      throw new AppException(
+        ErrorCode.ACCOUNT_TOKEN_EXPIRED,
+        'No refresh token. Please reconnect this account.',
+        400,
+      );
+    }
+
+    let refreshed: { accessToken: string; expiresAt: Date };
+
+    try {
+      if (platform === 'youtube' || platform === 'google') {
+        refreshed = await this.tokenRefresh.refreshGoogleToken(refreshToken!);
+        await this.prisma.socialAccount.update({
+          where: { id },
+          data: {
+            accessToken: this.encryption.encrypt(refreshed.accessToken),
+            tokenExpiresAt: refreshed.expiresAt,
+          },
+        });
+      } else if (platform === 'facebook') {
+        if (!process.env.FACEBOOK_APP_ID || !process.env.FACEBOOK_APP_SECRET) {
+          throw new AppException(
+            ErrorCode.EXTERNAL_API_ERROR,
+            'Facebook app is not configured. Cannot refresh token.',
+            503,
+          );
+        }
+        refreshed = await this.tokenRefresh.refreshFacebookToken(
+          accessToken || refreshToken!,
+          process.env.FACEBOOK_APP_ID,
+          process.env.FACEBOOK_APP_SECRET,
+        );
+        await this.prisma.socialAccount.update({
+          where: { id },
+          data: {
+            accessToken: this.encryption.encrypt(refreshed.accessToken),
+            tokenExpiresAt: refreshed.expiresAt,
+          },
+        });
+      } else if (platform === 'instagram') {
+        // Instagram uses its own long-lived refresh endpoint; getValidInstagramAccessToken refreshes and updates DB
+        await this.getValidInstagramAccessToken(id);
+        const updated = await this.prisma.socialAccount.findUnique({
+          where: { id },
+          select: { tokenExpiresAt: true },
+        });
+        if (!updated?.tokenExpiresAt) {
+          throw new AppException(
+            ErrorCode.ACCOUNT_TOKEN_EXPIRED,
+            'Instagram token could not be refreshed. Please reconnect.',
+            400,
+          );
+        }
+        this.logger.log(
+          `Manual refresh succeeded for instagram account ${accountId}, expires ${this.tokenExpiration.getTimeUntilExpirationHuman(updated.tokenExpiresAt)}`,
+        );
+        return { tokenExpiresAt: updated.tokenExpiresAt };
+      } else {
+        throw new AppException(
+          ErrorCode.ACCOUNT_INVALID_PLATFORM,
+          `Manual refresh is not supported for ${platform}.`,
+          400,
+        );
+      }
+
+      this.logger.log(
+        `Manual refresh succeeded for ${platform} account ${accountId}, expires ${this.tokenExpiration.getTimeUntilExpirationHuman(refreshed.expiresAt)}`,
+      );
+      return { tokenExpiresAt: refreshed.expiresAt };
+    } catch (e: any) {
+      const msg = e?.message || 'Token refresh failed';
+      this.logger.warn(`Manual refresh failed for account ${accountId}: ${msg}`, { errorCode: e?.errorCode });
+      if (e instanceof AppException) throw e;
+      if (msg.includes('invalid_grant') || msg.includes('expired') || msg.includes('re-authenticate')) {
+        throw new AppException(
+          ErrorCode.ACCOUNT_TOKEN_EXPIRED,
+          'Token is invalid or expired. Please reconnect this account.',
+          400,
+        );
+      }
+      throw new AppException(ErrorCode.EXTERNAL_API_ERROR, msg, 503);
+    }
   }
 
   // ---- GENERAL ----
@@ -1068,7 +1270,12 @@ const res = await axios.post(
     });
 
     if (!account) {
-      throw new BadRequestException('Account not found or does not belong to user');
+      this.logger.warn(`Delete account failed: not found or not owned`, { accountId, userId });
+      throw new AppException(
+        ErrorCode.ACCOUNT_NOT_FOUND,
+        'Account not found or does not belong to you.',
+        404,
+      );
     }
 
     // Check if there are any scheduled posts for this account
@@ -1080,9 +1287,14 @@ const res = await axios.post(
     });
 
     if (scheduledPostsCount > 0) {
-      console.log(`⚠️ Cannot delete account ${accountId}: ${scheduledPostsCount} scheduled post(s) found`);
-      throw new BadRequestException(
-        `Cannot delete account: There are ${scheduledPostsCount} scheduled post(s) associated with this account. Please cancel or complete them first.`
+      this.logger.warn(`Cannot delete account: has scheduled posts`, {
+        accountId,
+        count: scheduledPostsCount,
+      });
+      throw new AppException(
+        ErrorCode.POST_SCHEDULE_INVALID,
+        `Cannot delete account: ${scheduledPostsCount} scheduled post(s) are linked. Cancel or complete them first.`,
+        400,
       );
     }
 

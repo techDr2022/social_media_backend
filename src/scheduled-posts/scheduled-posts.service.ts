@@ -7,6 +7,7 @@ import { UpdateScheduledPostDto } from './dto/update-scheduled-post.dto';
 import { PublishPostJobData } from './queue/post-queue.types';
 import { QUEUE_NAMES, JOB_NAMES } from './queue/post-queue.types';
 import { QueueHelpers } from './queue/queue-helpers';
+import { DatabaseTransactionService } from '../common/database-transaction.service';
 
 @Injectable()
 export class ScheduledPostsService {
@@ -14,6 +15,7 @@ export class ScheduledPostsService {
     private readonly prisma: PrismaService,
     @InjectQueue(QUEUE_NAMES.POST_PUBLISH) private readonly postQueue: Queue,
     private readonly queueHelpers: QueueHelpers,
+    private readonly transactionService: DatabaseTransactionService,
   ) {}
 
   async create(userId: string, dto: CreateScheduledPostDto, media?: { url: string; filename: string; mimeType?: string; size?: number }) {
@@ -39,48 +41,60 @@ export class ScheduledPostsService {
       throw new BadRequestException(`Unsupported platform: ${dto.platform}`);
     }
 
-    // Create post in database
-    const post = await this.prisma.scheduledPost.create({
-      data: {
-        userId,
-        platform: dto.platform,
-        content: dto.content,
-        scheduledAt,
-        timezone: dto.timezone ?? undefined,
-        socialAccountId: dto.socialAccountId,
-        mediaUrl: media?.url ?? undefined,
-        status: 'pending',
-      },
-    });
+    // Use transaction to ensure atomicity: create post + add to queue
+    return await this.transactionService.executeInTransaction(async (tx) => {
+      // Create post in database
+      const post = await tx.scheduledPost.create({
+        data: {
+          userId,
+          platform: dto.platform,
+          content: dto.content,
+          scheduledAt,
+          timezone: dto.timezone ?? undefined,
+          socialAccountId: dto.socialAccountId,
+          mediaUrl: media?.url ?? undefined,
+          status: 'pending',
+        },
+      });
 
-    // Calculate delay in milliseconds
-    const delay = scheduledAt.getTime() - now.getTime();
-    
-    // Prepare job data
-    const jobData: PublishPostJobData = {
-      postId: post.id,
-      userId: post.userId,
-      socialAccountId: post.socialAccountId,
-      platform: post.platform as 'instagram' | 'facebook' | 'youtube',
-      content: post.content,
-      mediaUrl: post.mediaUrl || undefined,
-      mediaType: post.type || undefined,
-    };
+      // Calculate delay in milliseconds
+      const delay = scheduledAt.getTime() - now.getTime();
+      
+      // Prepare job data
+      const jobData: PublishPostJobData = {
+        postId: post.id,
+        userId: post.userId,
+        socialAccountId: post.socialAccountId,
+        platform: post.platform as 'instagram' | 'facebook' | 'youtube',
+        content: post.content,
+        mediaUrl: post.mediaUrl || undefined,
+        mediaType: post.type || undefined,
+      };
 
-    // Add job to BullMQ queue with delay
-    // Redis will automatically trigger this job at scheduled time
-    await this.postQueue.add(
-      JOB_NAMES.PUBLISH_POST,
-      jobData,
-      {
-        delay: delay, // Redis triggers job at exact scheduled time
-        jobId: `post-${post.id}`, // Unique job ID (prevents duplicates)
-        removeOnComplete: true,
-        removeOnFail: false, // Keep failed jobs for debugging
+      // Add job to BullMQ queue with delay using retry mechanism
+      // Redis will automatically trigger this job at scheduled time
+      try {
+        await this.queueHelpers.addJobWithRetry(
+          JOB_NAMES.PUBLISH_POST,
+          jobData,
+          {
+            delay: delay, // Redis triggers job at exact scheduled time
+            jobId: `post-${post.id}`, // Unique job ID (prevents duplicates)
+            removeOnComplete: true,
+            removeOnFail: false, // Keep failed jobs for debugging
+          },
+          3, // Max 3 retries with exponential backoff
+        );
+        console.log(`✅ Job added to queue for scheduled post ${post.id}, scheduled for ${dto.scheduledAt}`);
+      } catch (queueError: any) {
+        console.error(`❌ Failed to add scheduled post to queue after retries: ${queueError.message}`);
+        // If Redis fails, rollback the transaction to maintain consistency
+        // This ensures we don't have orphaned posts in the database
+        throw new BadRequestException(`Failed to schedule post: ${queueError.message}`);
       }
-    );
 
-    return post;
+      return post;
+    });
   }
 
   async findForUser(userId: string) {
@@ -152,6 +166,52 @@ export class ScheduledPostsService {
    */
   async getQueueStats() {
     return await this.queueHelpers.getQueueStats();
+  }
+
+  /**
+   * Get all media files for a user (for media library)
+   */
+  async findAllMediaForUser(userId: string) {
+    const posts = await this.prisma.scheduledPost.findMany({
+      where: {
+        userId,
+        mediaUrl: { not: null },
+      },
+      select: {
+        id: true,
+        platform: true,
+        mediaUrl: true,
+        content: true,
+        scheduledAt: true,
+        status: true,
+        createdAt: true,
+        socialAccount: {
+          select: {
+            id: true,
+            displayName: true,
+            username: true,
+          },
+        },
+      },
+      orderBy: {
+        createdAt: 'desc',
+      },
+    });
+
+    // Transform to media library format
+    return posts
+      .filter((post) => post.mediaUrl) // Ensure mediaUrl exists
+      .map((post) => ({
+        id: post.id,
+        platform: post.platform,
+        mediaUrl: post.mediaUrl,
+        caption: post.content || '',
+        scheduledAt: post.scheduledAt,
+        status: post.status,
+        createdAt: post.createdAt,
+        accountName: post.socialAccount?.displayName || post.socialAccount?.username || 'Unknown',
+        accountId: post.socialAccount?.id,
+      }));
   }
 
 }

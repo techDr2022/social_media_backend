@@ -202,6 +202,26 @@ export class SocialAccountsController {
     return this.socialAccounts.listForUser(user.id);
   }
 
+  // TOKEN STATUS (for "Your keys" page – no tokens exposed)
+  @UseGuards(SupabaseAuthGuard)
+  @Get('token-status')
+  getTokenStatus(@Req() req: Request) {
+    const user = (req as any).user;
+    return this.socialAccounts.getTokenStatusForUser(user.id);
+  }
+
+  // MANUAL REFRESH (single account)
+  @UseGuards(SupabaseAuthGuard)
+  @Post(':accountId/refresh')
+  async refreshToken(
+    @Req() req: Request,
+    @Param('accountId') accountId: string,
+  ) {
+    const user = (req as any).user;
+    const id = typeof accountId === 'string' ? accountId.trim() : '';
+    return this.socialAccounts.refreshAccountToken(id || accountId, user.id);
+  }
+
   // DELETE ACCOUNT
   @UseGuards(SupabaseAuthGuard)
   @Delete(':accountId')
