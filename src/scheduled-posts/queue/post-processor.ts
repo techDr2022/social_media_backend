@@ -131,19 +131,25 @@ export class PostProcessor {
       let result: PublishPostJobResult;
       
       switch (platform) {
-        case 'instagram':
+        case 'instagram': {
+          // Use carousel from job; fallback to DB when job data is missing/corrupted (e.g. Redis serialization)
+          const postData = scheduledPost?.data as { carouselUrls?: string[]; carouselItems?: Array<{ url: string; type: 'photo' | 'video' }> } | null;
+          const carouselItemsFromJob = Array.isArray(job.data.carouselItems) ? job.data.carouselItems : postData?.carouselItems;
+          const carouselUrlsFromJob = Array.isArray(job.data.carouselUrls) ? job.data.carouselUrls : postData?.carouselUrls;
+          const effectiveMediaType = mediaType === 'carousel' || (scheduledPost?.type === 'carousel' && (carouselItemsFromJob?.length || carouselUrlsFromJob?.length)) ? 'carousel' : mediaType;
           result = await this.publishInstagramPost({
             userId,
             socialAccountId,
             content,
             mediaUrl: processedMediaUrl,
-            mediaType,
-            carouselItems: job.data.carouselItems,
-            carouselUrls: job.data.carouselUrls,
+            mediaType: effectiveMediaType,
+            carouselItems: carouselItemsFromJob,
+            carouselUrls: carouselUrlsFromJob,
             locationId: job.data.locationId,
             userTags: job.data.userTags,
           });
           break;
+        }
           
         case 'facebook':
           result = await this.publishFacebookPost({
@@ -334,10 +340,10 @@ export class PostProcessor {
       }
     }
 
-    // 3) Infer mediaType when missing or wrong
+    // 3) Infer mediaType when missing or wrong (DB stores 'post' for non-carousel; Instagram needs 'photo'|'video'|'carousel')
     //    - If we have valid carousel items/urls → 'carousel'
     //    - Else, infer from mediaUrl file extension (mp4/mov → video, otherwise photo)
-    if (!mediaType) {
+    if (!mediaType || (mediaType as string) === 'post') {
       const hasCarousel =
         (normalizedCarouselItems && normalizedCarouselItems.length > 0) ||
         (normalizedCarouselUrls && normalizedCarouselUrls.length > 0);

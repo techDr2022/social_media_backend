@@ -49,6 +49,56 @@ export class SocialAccountsController {
     return res.redirect(`${frontendUrl}/schedule`);
   }
 
+  // START GMB OAUTH
+  @UseGuards(SupabaseAuthGuard)
+  @Get('connect/gmb')
+  connectGmb(@Req() req: Request, @Res() res: Response) {
+    const user = (req as any).user;
+    const url = this.socialAccounts.buildGmbOAuthUrl(user.id);
+    return res.redirect(url);
+  }
+
+  // GMB CALLBACK
+  @Get('callback/gmb')
+  async gmbCallback(@Req() req: Request, @Res() res: Response) {
+    const { code, state: userId } = req.query as any;
+    if (!code || !userId) {
+      const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3001';
+      return res.redirect(`${frontendUrl}/connect/gmb?error=${encodeURIComponent('Invalid OAuth callback - missing parameters')}`);
+    }
+
+    try {
+      await this.socialAccounts.handleGmbOAuthCallback({
+        code,
+        userId,
+      });
+
+      const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3001';
+      return res.redirect(`${frontendUrl}/gmb`);
+    } catch (error: any) {
+      console.error('[GMB Callback Controller] Error:', error);
+      
+      // Extract error message from NestJS exception (could be in error.message or error.response.message)
+      const errorMessage = error.response?.message || error.message || 'Unknown error';
+      const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3001';
+      
+      console.log('[GMB Callback Controller] Error message:', errorMessage);
+      
+      // If error message mentions tokens are saved OR rate limit, redirect to success page with warning
+      if (errorMessage.includes('Tokens have been saved') || 
+          errorMessage.includes('tokens have been saved') ||
+          errorMessage.includes('Rate limit') ||
+          errorMessage.includes('rate limit')) {
+        console.log('[GMB Callback Controller] Redirecting to GMB page with warning');
+        return res.redirect(`${frontendUrl}/gmb?warning=${encodeURIComponent(errorMessage)}`);
+      }
+      
+      // Otherwise, redirect to error page
+      console.log('[GMB Callback Controller] Redirecting to error page');
+      return res.redirect(`${frontendUrl}/connect/gmb?error=${encodeURIComponent(`GMB connection failed: ${errorMessage}`)}`);
+    }
+  }
+
   // TEST UPLOAD (DEV ONLY)
   @UseGuards(SupabaseAuthGuard)
   @Post('youtube/test-upload')

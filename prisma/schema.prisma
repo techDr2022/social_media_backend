@@ -16,6 +16,9 @@ model User {
   socialAccounts SocialAccount[]
   subscriptions  Subscription[]
   alerts         Alert[]
+  gmbLocations   GmbLocation[]
+  gmbPosts       GmbPost[]
+  gmbReviews     GmbReview[]
 }
 
 model SocialAccount {
@@ -130,7 +133,7 @@ model Alert {
   socialAccountId String?
   scheduledPostId String?       // Link to the scheduled post
   type            String        // 'scheduled', 'processing', 'success', 'failed'
-  platform        String        // 'instagram', 'facebook', 'youtube'
+  platform        String        // 'instagram', 'facebook', 'youtube', 'gmb'
   title           String        // Alert title (e.g., "Post Scheduled")
   message         String        // Alert message (e.g., "Your photo post for @accountname is scheduled for Feb 5, 2026 at 3:00 PM")
   accountName     String?       // Display name of the social account
@@ -145,4 +148,74 @@ model Alert {
   @@index([userId, createdAt]) // For user's all alerts, newest first
   @@index([isRead]) // For bulk read operations
   @@index([type]) // For filtering by type
+}
+
+// Google My Business Models
+model GmbLocation {
+  id              String      @id @default(uuid())
+  userId          String
+  socialAccountId String?     // Link to the GMB account that owns this location (nullable for migration)
+  gmbLocationId   String      // Maps to GBP locationId (e.g., from API)
+  name            String      // Location name (e.g., "Store #1")
+  phoneNumber     String?     // Optional phone number from GBP
+  accountName     String?     // Account name from GMB
+  address         String?     // Store address
+  posts           GmbPost[]   // Relation to scheduled posts
+  reviews         GmbReview[] // Relation to reviews
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+  user            User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([socialAccountId])
+  @@index([gmbLocationId])
+  @@index([socialAccountId, gmbLocationId]) // Index for unique constraint (will be unique per account after migration)
+}
+
+model GmbPost {
+  id          String      @id @default(uuid())
+  userId      String
+  locationId  String
+  location    GmbLocation @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  content     String      // Post text
+  imageUrl    String?     // Optional image URL
+  videoUrl    String?     // Optional video URL
+  scheduledAt DateTime    // When to post
+  status      String      @default("scheduled") // scheduled, posted, failed
+  ctaType     String?     // LEARN_MORE, BOOK, ORDER, BUY, SIGN_UP, CALL
+  ctaUrl      String?     // Call-to-action URL
+  externalPostId String?  // GMB post ID from API
+  searchUrl      String?  // Link to view post on Google (from API)
+  errorMessage   String?  // Error message if failed
+  postedAt    DateTime?   // When actually posted
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+  user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([locationId])
+  @@index([status])
+  @@index([scheduledAt])
+  @@index([userId])
+}
+
+model GmbReview {
+  id          String      @id @default(uuid())
+  userId      String
+  gmbReviewId String      @unique // Maps to GBP reviewId (e.g., "A123")
+  name        String?     // Name of the reviewer
+  locationId  String
+  location    GmbLocation @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  comment     String?     // Review text (optional)
+  rating      Int         // 1-5 stars
+  responded   Boolean     @default(false) // Has a reply been posted?
+  reply       String?     // AI-generated reply
+  externalReviewId String? // External review ID from GMB API
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+  user        User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([locationId])
+  @@index([gmbReviewId])
+  @@index([userId])
+  @@index([responded])
 }
