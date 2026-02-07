@@ -13,6 +13,7 @@ import { AppService } from './app.service';
 import { YoutubeModule } from './social-accounts/providers/youtube/youtube.module';
 import { FacebookModule } from './social-accounts/providers/facebook/facebook.module';
 import { InstagramModule } from './social-accounts/providers/instagram/instagram.module';
+import { GmbModule } from './social-accounts/providers/gmb/gmb.module';
 import { LogsModule } from './logs/logs.module';
 import { APP_INTERCEPTOR } from '@nestjs/core';
 import { LoggingInterceptor } from './logs/logging.interceptor';
@@ -45,6 +46,7 @@ import { AlertsModule } from './alerts/alerts.module';
     YoutubeModule,
     FacebookModule,
     InstagramModule,
+    GmbModule,
     LogsModule,
     HealthModule,
     AlertsModule, // ⭐ Alerts/notifications module

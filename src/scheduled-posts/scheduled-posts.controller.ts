@@ -51,10 +51,13 @@ import {
     ) {
       const user = (req as any).user;
       if (!user?.id) throw new BadRequestException('Missing user');
-  
+
+      console.log(`[ScheduledPosts] Schedule request received: ${body.platform} for account ${body.socialAccountId}, at ${body.scheduledAt}`);
+
       let media;
       if (file) {
         // File uploaded - use local storage
+        console.log(`[ScheduledPosts] Using uploaded file: ${file.originalname} (${(file.size / 1024).toFixed(1)} KB)`);
         const url = `/uploads/${file.filename}`; // served by ServeStaticModule
         media = {
           url,
@@ -69,7 +72,7 @@ import {
           filename: body.mediaUrl.split('/').pop() || 'media',
         };
       }
-  
+
       const post = await this.service.create(user.id, body, media);
       return post;
     }

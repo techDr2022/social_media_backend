@@ -24,4 +24,14 @@ export class CreateScheduledPostDto {
   @IsOptional()
   @IsString()
   mediaUrl?: string; // Support direct media URL (from Supabase Storage)
+
+  /** JSON string array of carousel media URLs (e.g. from FormData). */
+  @IsOptional()
+  @IsString()
+  carouselUrls?: string;
+
+  /** JSON string array of { url, type: 'photo'|'video' } for Instagram carousel. */
+  @IsOptional()
+  @IsString()
+  carouselItems?: string;
 }

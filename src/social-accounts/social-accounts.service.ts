@@ -203,6 +203,433 @@ const res = await axios.post(
     };
   }
 
+  // ---- GOOGLE MY BUSINESS (GMB) ----
+
+  async getValidGmbAccessToken(socialAccountId: string) {
+    const account = await this.prisma.socialAccount.findUnique({
+      where: { id: socialAccountId },
+    });
+
+    if (!account || account.platform !== 'gmb') {
+      throw new Error('Invalid GMB account');
+    }
+
+    const refreshToken = this.encryption.decrypt(account.refreshToken);
+    if (!refreshToken) {
+      throw new Error('Missing refresh token');
+    }
+
+    // Check if token is expired or expiring soon (within 5 minutes)
+    const now = new Date();
+    const expiresAt = account.tokenExpiresAt;
+    const fiveMinutesFromNow = new Date(now.getTime() + 5 * 60 * 1000);
+
+    if (!expiresAt || expiresAt <= fiveMinutesFromNow) {
+      this.logger.log(`GMB token expired or expiring soon, refreshing...`);
+      
+      // Use GMB-specific credentials for token refresh
+      const gmbClientId =
+        process.env.GMB_GOOGLE_CLIENT_ID || process.env.GOOGLE_OAUTH_CLIENT_ID!;
+      const gmbClientSecret =
+        process.env.GMB_GOOGLE_CLIENT_SECRET || process.env.GOOGLE_OAUTH_CLIENT_SECRET!;
+      
+      const refreshed = await this.refreshGmbToken(refreshToken, gmbClientId, gmbClientSecret);
+      
+      const expiresIn = refreshed.expiresIn || 3600; // Default to 1 hour
+      const newExpiresAt = new Date(now.getTime() + expiresIn * 1000);
+
+      await this.prisma.socialAccount.update({
+        where: { id: account.id },
+        data: {
+          accessToken: this.encryption.encrypt(refreshed.accessToken),
+          tokenExpiresAt: newExpiresAt,
+        },
+      });
+
+      return refreshed.accessToken;
+    }
+
+    const accessToken = this.encryption.decrypt(account.accessToken);
+    this.logger.log(`Using GMB access token, expires at: ${account.tokenExpiresAt}`);
+    return accessToken;
+  }
+
+  /**
+   * Refresh GMB token using GMB-specific credentials
+   */
+  private async refreshGmbToken(
+    refreshToken: string,
+    clientId: string,
+    clientSecret: string,
+  ): Promise<{ accessToken: string; expiresIn: number }> {
+    try {
+      const response = await axios.post(
+        'https://oauth2.googleapis.com/token',
+        new URLSearchParams({
+          client_id: clientId,
+          client_secret: clientSecret,
+          grant_type: 'refresh_token',
+          refresh_token: refreshToken,
+        }),
+        {
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+          },
+          timeout: 30000,
+        },
+      );
+
+      if (!response.data.access_token) {
+        throw new Error('No access token in response');
+      }
+
+      return {
+        accessToken: response.data.access_token,
+        expiresIn: response.data.expires_in || 3600,
+      };
+    } catch (error: any) {
+      const errorMessage =
+        error.response?.data?.error_description ||
+        error.response?.data?.error ||
+        error.message;
+      this.logger.error(`GMB token refresh failed: ${errorMessage}`);
+      throw new Error(`GMB token refresh failed: ${errorMessage}`);
+    }
+  }
+
+  buildGmbOAuthUrl(userId: string) {
+    // Ensure redirect URI is a full URL (not just a path)
+    let redirectUri = process.env.GOOGLE_OAUTH_REDIRECT_URI_GMB;
+    if (!redirectUri) {
+      // Fallback: replace /youtube with /gmb in the YouTube redirect URI
+      const youtubeUri = process.env.GOOGLE_OAUTH_REDIRECT_URI || 'http://localhost:3001/social-accounts/callback/youtube';
+      redirectUri = youtubeUri.replace('/youtube', '/gmb');
+    }
+    
+    // Ensure it's a full URL (starts with http:// or https://)
+    if (!redirectUri.startsWith('http://') && !redirectUri.startsWith('https://')) {
+      // If it's just a path, prepend the frontend URL
+      const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3001';
+      redirectUri = `${frontendUrl}${redirectUri.startsWith('/') ? '' : '/'}${redirectUri}`;
+    }
+
+    // Prefer dedicated GMB client if provided, otherwise fall back to main Google OAuth client
+    const gmbClientId =
+      process.env.GMB_GOOGLE_CLIENT_ID || process.env.GOOGLE_OAUTH_CLIENT_ID!;
+
+    const params = new URLSearchParams({
+      client_id: gmbClientId,
+      redirect_uri: redirectUri,
+      response_type: 'code',
+      access_type: 'offline',
+      prompt: 'consent',
+      scope: [
+        'https://www.googleapis.com/auth/business.manage',
+        'https://www.googleapis.com/auth/businesscommunications',
+      ].join(' '),
+      state: userId,
+    });
+
+    return `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
+  }
+
+  async handleGmbOAuthCallback({
+    code,
+    userId,
+  }: {
+    code: string;
+    userId: string;
+  }) {
+    // Prefer dedicated GMB client/secret if provided, otherwise fall back to main Google OAuth client
+    const clientId =
+      process.env.GMB_GOOGLE_CLIENT_ID || process.env.GOOGLE_OAUTH_CLIENT_ID;
+    const clientSecret =
+      process.env.GMB_GOOGLE_CLIENT_SECRET ||
+      process.env.GOOGLE_OAUTH_CLIENT_SECRET;
+
+    // Ensure redirect URI is a full URL
+    let redirectUri = process.env.GOOGLE_OAUTH_REDIRECT_URI_GMB;
+    if (!redirectUri) {
+      const youtubeUri =
+        process.env.GOOGLE_OAUTH_REDIRECT_URI ||
+        'http://localhost:3001/social-accounts/callback/youtube';
+      redirectUri = youtubeUri.replace('/youtube', '/gmb');
+    }
+    // Ensure it's a full URL
+    if (
+      !redirectUri.startsWith('http://') &&
+      !redirectUri.startsWith('https://')
+    ) {
+      const frontendUrl =
+        process.env.FRONTEND_URL || 'http://localhost:3001';
+      redirectUri = `${frontendUrl}${
+        redirectUri.startsWith('/') ? '' : '/'
+      }${redirectUri}`;
+    }
+
+    // Log for debugging (don't log full secret)
+    this.logger.log(
+      `GMB OAuth callback - Client ID: ${clientId?.substring(0, 20)}..., Redirect URI: ${redirectUri}`,
+    );
+
+    // Exchange code for tokens with timeout
+    const tokenRes = await axios.post(
+      'https://oauth2.googleapis.com/token',
+      {
+        client_id: clientId,
+        client_secret: clientSecret,
+        code,
+        grant_type: 'authorization_code',
+        redirect_uri: redirectUri,
+      },
+      {
+        timeout: 30000, // 30 second timeout
+      },
+    );
+
+    const { access_token, refresh_token, expires_in } = tokenRes.data;
+
+      // Fetch GMB accounts to get account info with timeout and pagination
+      try {
+        // Fetch all accounts with pagination support
+        const allAccounts: any[] = [];
+        let nextPageToken: string | undefined = undefined;
+        let pageCount = 0;
+        const maxPages = 100; // Safety limit to prevent infinite loops
+
+        do {
+          const params: any = {};
+          if (nextPageToken) {
+            params.pageToken = nextPageToken;
+          }
+
+          const accountsRes = await axios.get(
+            'https://mybusinessaccountmanagement.googleapis.com/v1/accounts',
+            {
+              headers: { Authorization: `Bearer ${access_token}` },
+              params,
+              timeout: 30000, // 30 second timeout
+            }
+          );
+
+          const accounts = accountsRes.data.accounts || [];
+          allAccounts.push(...accounts);
+          
+          nextPageToken = accountsRes.data.nextPageToken;
+          pageCount++;
+
+          this.logger.log(
+            `Fetched GMB accounts page ${pageCount}: ${accounts.length} accounts (total so far: ${allAccounts.length})`
+          );
+
+          // Safety check to prevent infinite loops
+          if (pageCount >= maxPages) {
+            this.logger.warn(`Reached max pages limit (${maxPages}), stopping pagination`);
+            break;
+          }
+        } while (nextPageToken);
+
+        if (allAccounts.length === 0) {
+          throw new BadRequestException('No Google My Business accounts found');
+        }
+
+        this.logger.log(`Total GMB accounts found: ${allAccounts.length}`);
+
+      // Save ALL GMB accounts, not just the first one
+      const createdAccounts: any[] = [];
+      const scopes = 'https://www.googleapis.com/auth/business.manage https://www.googleapis.com/auth/businesscommunications';
+
+      for (const account of allAccounts) {
+        const accountId = account.name?.split('/').pop() || account.name || 'unknown';
+        // Use Google's readable name: accountName (business/person name), fallback to type + ID
+        const displayName =
+          account.accountName?.trim() ||
+          (account.organizationInfo?.address as any)?.organization?.trim() ||
+          (account.type === 'LOCATION_GROUP' ? `Location group · ${accountId}` : account.type === 'PERSONAL' ? 'Personal account' : `Account · ${accountId}`);
+
+        // Check if account already exists
+        const existingAccount = await this.prisma.socialAccount.findFirst({
+          where: {
+            userId,
+            platform: 'gmb',
+            externalId: accountId,
+          },
+        });
+
+        if (existingAccount) {
+          // Update existing account
+          const updated = await this.prisma.socialAccount.update({
+            where: { id: existingAccount.id },
+            data: {
+              displayName,
+              accessToken: this.encryption.encrypt(access_token),
+              refreshToken: this.encryption.encrypt(refresh_token),
+              tokenExpiresAt: new Date(Date.now() + expires_in * 1000),
+              isActive: true,
+              scopes,
+            },
+          });
+          createdAccounts.push(updated);
+        } else {
+          // Create new account
+          const created = await this.prisma.socialAccount.create({
+            data: {
+              userId,
+              platform: 'gmb',
+              accountType: account.type || 'LOCATION_GROUP',
+              externalId: accountId,
+              displayName,
+              accessToken: this.encryption.encrypt(access_token),
+              refreshToken: this.encryption.encrypt(refresh_token),
+              tokenExpiresAt: new Date(Date.now() + expires_in * 1000),
+              scopes,
+            },
+          });
+          createdAccounts.push(created);
+        }
+      }
+
+      // Return the first account for backward compatibility, but all are saved
+      return createdAccounts[0];
+    } catch (error: any) {
+      // Log full error from Google to diagnose 403
+      const status = error.response?.status;
+      const googleError = error.response?.data?.error;
+      const reason = googleError?.message || error.message;
+      const code = googleError?.code || error.response?.status;
+      this.logger.error(
+        `Error fetching GMB accounts: ${reason} (status=${status}, code=${code})`
+      );
+      if (error.response?.data) {
+        this.logger.debug(`GMB API response: ${JSON.stringify(error.response.data)}`);
+      }
+
+      // For 429 (rate limit) errors, save tokens and tell user to wait/request quota
+      if (error.response?.status === 429) {
+        this.logger.warn('GMB API rate limit exceeded (429). Saving tokens. User needs to wait or request quota increase.');
+        
+        // Extract quota info from Google's error
+        const quotaInfo = error.response?.data?.error?.details?.find((d: any) => d['@type'] === 'type.googleapis.com/google.rpc.ErrorInfo');
+        const quotaLimit = quotaInfo?.metadata?.quota_limit_value || 'unknown';
+        
+        // Check if pending sync account already exists
+        const pendingExternalId = `pending-sync-${userId}`;
+        const existingPending = await this.prisma.socialAccount.findFirst({
+          where: {
+            userId,
+            platform: 'gmb',
+            externalId: pendingExternalId,
+          },
+        });
+        
+        // Create or update placeholder account
+        const placeholderAccount = existingPending
+          ? await this.prisma.socialAccount.update({
+              where: { id: existingPending.id },
+              data: {
+                accessToken: this.encryption.encrypt(access_token),
+                refreshToken: this.encryption.encrypt(refresh_token),
+                tokenExpiresAt: new Date(Date.now() + expires_in * 1000),
+                isActive: true,
+                scopes: 'https://www.googleapis.com/auth/business.manage https://www.googleapis.com/auth/businesscommunications',
+                displayName: 'Google My Business (Rate Limited)',
+              },
+            })
+          : await this.prisma.socialAccount.create({
+              data: {
+                userId,
+                platform: 'gmb',
+                externalId: pendingExternalId,
+                displayName: 'Google My Business (Rate Limited)',
+                accessToken: this.encryption.encrypt(access_token),
+                refreshToken: this.encryption.encrypt(refresh_token),
+                tokenExpiresAt: new Date(Date.now() + expires_in * 1000),
+                scopes: 'https://www.googleapis.com/auth/business.manage https://www.googleapis.com/auth/businesscommunications',
+                accountType: 'PENDING_SYNC',
+              },
+            });
+        
+        throw new BadRequestException(
+          `Rate limit exceeded (429). Your quota is ${quotaLimit} requests/minute. ` +
+          `Tokens have been saved. ` +
+          `Wait 1 minute and try "Sync Locations" again, or request quota increase: ` +
+          `https://console.cloud.google.com/apis/api/mybusinessaccountmanagement.googleapis.com/quotas?project=568077365772`
+        );
+      }
+
+      // For 403 errors, save tokens but mark account as needing sync
+      // User can sync accounts later once API is enabled
+      if (error.response?.status === 403) {
+        // Extract activation URL from Google's error response if available
+        const googleErrorDetails = error.response?.data?.error?.details || [];
+        const activationUrl = googleErrorDetails.find((d: any) => d['@type'] === 'type.googleapis.com/google.rpc.ErrorInfo')?.metadata?.activationUrl
+          || googleErrorDetails.find((d: any) => d.links)?.links?.[0]?.url
+          || 'https://console.cloud.google.com/apis/library/mybusinessaccountmanagement.googleapis.com';
+        
+        this.logger.warn(
+          `GMB API access denied (403). Saving tokens for later sync. ` +
+          `Enable API at: ${activationUrl}`
+        );
+        
+        // Check if pending sync account already exists
+        const pendingExternalId = `pending-sync-${userId}`;
+        const existingPending = await this.prisma.socialAccount.findFirst({
+          where: {
+            userId,
+            platform: 'gmb',
+            externalId: pendingExternalId,
+          },
+        });
+        
+        // Create or update placeholder account that can be synced later
+        const placeholderAccount = existingPending
+          ? await this.prisma.socialAccount.update({
+              where: { id: existingPending.id },
+              data: {
+                accessToken: this.encryption.encrypt(access_token),
+                refreshToken: this.encryption.encrypt(refresh_token),
+                tokenExpiresAt: new Date(Date.now() + expires_in * 1000),
+                isActive: true,
+                scopes: 'https://www.googleapis.com/auth/business.manage https://www.googleapis.com/auth/businesscommunications',
+                displayName: 'Google My Business (Pending Sync)',
+              },
+            })
+          : await this.prisma.socialAccount.create({
+              data: {
+                userId,
+                platform: 'gmb',
+                externalId: pendingExternalId,
+                displayName: 'Google My Business (Pending Sync)',
+                accessToken: this.encryption.encrypt(access_token),
+                refreshToken: this.encryption.encrypt(refresh_token),
+                tokenExpiresAt: new Date(Date.now() + expires_in * 1000),
+                scopes: 'https://www.googleapis.com/auth/business.manage https://www.googleapis.com/auth/businesscommunications',
+                accountType: 'PENDING_SYNC',
+              },
+            });
+        
+        // Build helpful message with exact API name and Google's activation URL
+        const apiName = 'My Business Account Management API';
+        const googleMessage = error.response?.data?.error?.message || '';
+        throw new BadRequestException(
+          `403 Error: ${googleMessage.split('.')[0]}. ` +
+          `We use 3 different Google APIs: 1) "My Business Account Management API" (for listing accounts - REQUIRED), ` +
+          `2) "My Business Business Information API" (for locations), 3) "Google My Business API" (for reviews). ` +
+          `You enabled #3, but we need #1 first. ` +
+          `Tokens have been saved. Enable it here: ${activationUrl} ` +
+          `Then wait 1-2 minutes and use "Sync Locations" to fetch your accounts.`
+        );
+      }
+      
+      // For other errors, provide a helpful message
+      const errorMessage = error.response?.data?.error?.message || error.message || 'Unknown error';
+      throw new BadRequestException(
+        `Failed to fetch Google My Business accounts: ${errorMessage}. ` +
+        'Please check your Google Cloud Console settings and try again.'
+      );
+    }
+  }
+
   // ---- FACEBOOK ----
 
   async getValidFacebookAccessToken(socialAccountId: string) {

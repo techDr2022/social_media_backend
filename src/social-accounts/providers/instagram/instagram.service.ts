@@ -230,8 +230,17 @@ export class InstagramService {
         throw new BadRequestException('Media URL is required for photo/video posts');
       }
 
+      // Normalize mediaType: DB/job may send 'post'; we need 'photo' or 'video' for single media
+      let effectiveMediaType = mediaType;
+      if ((effectiveMediaType as string) === 'post' || (effectiveMediaType && !['photo', 'video', 'carousel'].includes(effectiveMediaType as 'photo' | 'video' | 'carousel'))) {
+        if (mediaUrl) {
+          const url = mediaUrl.toLowerCase().split('?')[0];
+          effectiveMediaType = url.endsWith('.mp4') || url.endsWith('.mov') ? 'video' : 'photo';
+        }
+      }
+
       // Create media container (for immediate posts only - scheduled posts use queue system above)
-      if (mediaType === 'photo' && mediaUrl) {
+      if (effectiveMediaType === 'photo' && mediaUrl) {
         // Photo post
         const containerData: any = {
           image_url: mediaUrl,
@@ -339,7 +348,7 @@ export class InstagramService {
           userId,
           socialAccountId,
         );
-      } else if (mediaType === 'video' && mediaUrl) {
+      } else if (effectiveMediaType === 'video' && mediaUrl) {
         // Video post
         // First, validate video URL is accessible
         try {
@@ -472,7 +481,7 @@ export class InstagramService {
           throw new InternalServerErrorException('Failed to create video container');
         }
         await this.waitForVideoProcessing(mediaContainerId, accessToken, userId, socialAccountId);
-      } else if (mediaType === 'carousel' && ((carouselUrls && carouselUrls.length > 0) || (carouselItems && carouselItems.length > 0))) {
+      } else if (effectiveMediaType === 'carousel' && ((carouselUrls && carouselUrls.length > 0) || (carouselItems && carouselItems.length > 0))) {
         // Carousel post - create multiple media containers and then a carousel container
         console.log('🎠 Creating Instagram carousel post...');
         console.log('🔄 Using Instagram Graph API (graph.instagram.com) for Instagram Login...');
@@ -728,14 +737,15 @@ export class InstagramService {
           throw new InternalServerErrorException('Carousel container ID is missing');
         }
         await this.waitForCarouselProcessing(mediaContainerId, accessToken, userId, socialAccountId);
-      } else if (!mediaType || (!mediaUrl && !(mediaType === 'carousel' && ((carouselUrls && carouselUrls.length > 0) || (carouselItems && carouselItems.length > 0))))) {
+      } else if (!effectiveMediaType || (!mediaUrl && !(effectiveMediaType === 'carousel' && ((carouselUrls && carouselUrls.length > 0) || (carouselItems && carouselItems.length > 0))))) {
         // Text-only post (not supported by Instagram, but we'll handle gracefully)
         throw new BadRequestException('Instagram requires media (photo or video). Text-only posts are not supported.');
       }
 
       // Ensure mediaContainerId is set
       if (!mediaContainerId) {
-        throw new BadRequestException('Failed to create media container');
+        const hint = effectiveMediaType ? `mediaType=${effectiveMediaType}, mediaUrl=${mediaUrl ? 'set' : 'missing'}` : 'mediaType not photo/video/carousel';
+        throw new BadRequestException(`Failed to create media container (${hint}). Check that media URL is accessible by Instagram.`);
       }
 
       // Publish the media container
